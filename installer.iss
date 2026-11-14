@@ -1,5 +1,5 @@
 ; 当前用户安装，无需管理员权限。开机启动由用户在安装时选择。
-#define AppVersion "0.1.4"
+#define AppVersion "0.1.5"
 [Setup]
 AppId={{0E226C97-BCB8-4DCC-922E-38DA79D48D57}
 AppName=瞬贴
@@ -53,6 +53,11 @@ Source: "dist\bin\ffmpeg.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "dist\bin\gifski.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "dist\bin\gifski.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "dist\bin\gifski-export.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "dist\bin\avcodec-61.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "dist\bin\avformat-61.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "dist\bin\avutil-59.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "dist\bin\swscale-8.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "dist\bin\swresample-5.dll"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "dist\第三方说明.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 

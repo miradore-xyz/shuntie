@@ -20,6 +20,11 @@ $env:SHUNTIE_GNU_LINKER=Join-Path $LlvmMingwRoot 'bin\x86_64-w64-mingw32-clang.e
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=Join-Path $PSScriptRoot 'gnu-link.cmd'
 $env:CC_x86_64_pc_windows_gnu=$env:SHUNTIE_GNU_LINKER
 $env:AR_x86_64_pc_windows_gnu=Join-Path $LlvmMingwRoot 'bin\llvm-ar.exe'
+# 编入已公开的增量帧调色接口，复用同一版本的 imagequant。
+Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\native-quantizer.rs') -Destination (Join-Path $sourceRoot 'src\shuntie_quantizer.rs') -Force
+$librarySource=Join-Path $sourceRoot 'src\lib.rs'
+$libraryText=[IO.File]::ReadAllText($librarySource)
+if(-not $libraryText.Contains('mod shuntie_quantizer;')) { [IO.File]::WriteAllText($librarySource,$libraryText+"`nmod shuntie_quantizer;`n",[Text.UTF8Encoding]::new($false)) }
 & cargo build --manifest-path (Join-Path $sourceRoot 'Cargo.toml') --target x86_64-pc-windows-gnu --release --locked --features capi
 if ($LASTEXITCODE -ne 0) { throw 'Gifski 构建失败。' }
 $target=Join-Path $sourceRoot 'target\x86_64-pc-windows-gnu\release'

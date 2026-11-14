@@ -28,7 +28,7 @@ bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstr
     fps=std::clamp(fps,1,50);
     std::wstring helper=gifski.substr(0,gifski.find_last_of(L"\\/"))+L"\\gifski-export.exe";if(nonempty(helper)){Child process;return launch(process,helper,quote(ff)+L" "+quote(gifski)+L" "+quote(video)+L" "+quote(gif)+L" "+quote(log)+L" "+std::to_wstring(fps)+L" "+std::to_wstring(width)+L" "+std::to_wstring(height),log)&&result(process)==0&&nonempty(gif);}
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
-    Child encoder,decoder;bool enc=launch(encoder,gifski,L"--quiet --quality 90 --fps "+std::to_wstring(fps)+L" -o "+quote(gif)+L" -",log,read);CloseHandle(read);
+    Child encoder,decoder;bool enc=launch(encoder,gifski,L"--quiet --quality 90 --width "+std::to_wstring(width)+L" --height "+std::to_wstring(height)+L" --fps "+std::to_wstring(fps)+L" -o "+quote(gif)+L" -",log,read);CloseHandle(read);
     bool dec=enc&&launch(decoder,ff,L"-hide_banner -nostdin -i "+quote(video)+L" -vf fps="+std::to_wstring(fps)+L" -pix_fmt yuv420p -f yuv4mpegpipe -",log,nullptr,write);CloseHandle(write);
     DWORD dc=dec?result(decoder):1,ec=enc?result(encoder):1;return dc==0&&ec==0&&nonempty(gif);
 }

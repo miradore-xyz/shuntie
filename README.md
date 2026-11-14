@@ -13,10 +13,12 @@ Windows 截图、可编辑标注、桌面贴图和区域录屏工具。使用小
 安装 Zig 0.17.0 后，在 PowerShell 中执行：
 
 ```powershell
-# 编译主程序，并检查对象几何和中英文切换。
-./build.ps1 -Test
 # 下载固定版本的录制和 GIF 编码器。
 ./tools/fetch_dependencies.ps1
+# 编译主程序，并检查对象几何和中英文切换。
+./build.ps1 -Test
+# 后台 GIF 文件回归：需 Python 与 Pillow，不操作桌面。
+python ./tests/gif_native_test.py
 # 生成安装版和便携版，需要 Inno Setup 的 ISCC.exe。
 ./package.ps1 -InnoCompiler 'C:\路径\ISCC.exe'
 ```
