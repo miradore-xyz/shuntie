@@ -38,12 +38,22 @@ inline Image clipboardImage(HWND owner){
     auto bitmap=static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));if(bitmap)im=fromBitmap(bitmap);
     CloseClipboard();return im;
 }
+inline HGLOBAL imageDib(const Image& im,bool version5){
+    size_t headerSize=version5?sizeof(BITMAPV5HEADER):sizeof(BITMAPINFOHEADER);HGLOBAL data=GlobalAlloc(GMEM_MOVEABLE|GMEM_ZEROINIT,headerSize+im.pixels.size());if(!data)return nullptr;auto p=static_cast<unsigned char*>(GlobalLock(data));if(!p){GlobalFree(data);return nullptr;}
+    if(version5){auto h=reinterpret_cast<BITMAPV5HEADER*>(p);h->bV5Size=sizeof(*h);h->bV5Width=im.width;h->bV5Height=-im.height;h->bV5Planes=1;h->bV5BitCount=32;h->bV5Compression=BI_BITFIELDS;h->bV5SizeImage=DWORD(im.pixels.size());h->bV5RedMask=0x00FF0000;h->bV5GreenMask=0x0000FF00;h->bV5BlueMask=0x000000FF;h->bV5AlphaMask=0xFF000000;h->bV5CSType=LCS_sRGB;h->bV5Intent=LCS_GM_IMAGES;}
+    else{BITMAPINFOHEADER header{sizeof(BITMAPINFOHEADER),im.width,-im.height,1,32,BI_RGB,DWORD(im.pixels.size())};memcpy(p,&header,sizeof(header));}
+    memcpy(p+headerSize,im.pixels.data(),im.pixels.size());GlobalUnlock(data);return data;
+}
+inline HGLOBAL imagePng(const Image& im){
+    IStream* stream=nullptr;IWICBitmapEncoder* encoder=nullptr;IWICBitmapFrameEncode* frame=nullptr;IPropertyBag2* props=nullptr;HRESULT hr=CreateStreamOnHGlobal(nullptr,TRUE,&stream);
+    if(SUCCEEDED(hr))hr=wic->CreateEncoder(GUID_ContainerFormatPng,nullptr,&encoder);if(SUCCEEDED(hr))hr=encoder->Initialize(stream,WICBitmapEncoderNoCache);if(SUCCEEDED(hr))hr=encoder->CreateNewFrame(&frame,&props);if(SUCCEEDED(hr))hr=frame->Initialize(props);if(SUCCEEDED(hr))hr=frame->SetSize(im.width,im.height);auto format=GUID_WICPixelFormat32bppBGRA;if(SUCCEEDED(hr))hr=frame->SetPixelFormat(&format);if(SUCCEEDED(hr))hr=frame->WritePixels(im.height,im.width*4,UINT(im.pixels.size()),const_cast<BYTE*>(im.pixels.data()));if(SUCCEEDED(hr))hr=frame->Commit();if(SUCCEEDED(hr))hr=encoder->Commit();
+    HGLOBAL result=nullptr,backing=nullptr;STATSTG stat{};if(SUCCEEDED(hr)&&SUCCEEDED(stream->Stat(&stat,STATFLAG_NONAME))&&SUCCEEDED(GetHGlobalFromStream(stream,&backing))){result=GlobalAlloc(GMEM_MOVEABLE,SIZE_T(stat.cbSize.QuadPart));if(result){void* dst=GlobalLock(result);void* src=GlobalLock(backing);if(dst&&src)memcpy(dst,src,SIZE_T(stat.cbSize.QuadPart));if(src)GlobalUnlock(backing);if(dst)GlobalUnlock(result);if(!dst||!src){GlobalFree(result);result=nullptr;}}}
+    release(props);release(frame);release(encoder);release(stream);return result;
+}
 inline bool copyImage(HWND owner,const Image& im){
-    if(!im.valid()||!OpenClipboard(owner))return false;size_t bytes=sizeof(BITMAPINFOHEADER)+im.pixels.size();HGLOBAL data=GlobalAlloc(GMEM_MOVEABLE,bytes);
-    if(!data){CloseClipboard();return false;}auto p=static_cast<unsigned char*>(GlobalLock(data));
-    if(!p){GlobalFree(data);CloseClipboard();return false;}
-    BITMAPINFOHEADER header{sizeof(BITMAPINFOHEADER),im.width,-im.height,1,32,BI_RGB};memcpy(p,&header,sizeof(header));memcpy(p+sizeof(header),im.pixels.data(),im.pixels.size());GlobalUnlock(data);
-    EmptyClipboard();bool ok=SetClipboardData(CF_DIB,data)!=nullptr;if(!ok)GlobalFree(data);CloseClipboard();return ok;
+    if(!im.valid())return false;UINT formats[]={RegisterClipboardFormatW(L"PNG"),CF_DIBV5,CF_DIB};HGLOBAL data[]={imagePng(im),imageDib(im,true),imageDib(im,false)};
+    if(!OpenClipboard(owner)){for(auto h:data)if(h)GlobalFree(h);return false;}
+    EmptyClipboard();bool ok=false;for(int i=0;i<3;++i)if(data[i]){if(SetClipboardData(formats[i],data[i]))ok=true;else GlobalFree(data[i]);}CloseClipboard();return ok;
 }
 inline bool savePng(const Image& im,const std::wstring& path){
     IWICStream* stream=nullptr;IWICBitmapEncoder* encoder=nullptr;IWICBitmapFrameEncode* frame=nullptr;IPropertyBag2* props=nullptr;
@@ -84,6 +94,18 @@ inline void renderShape(ID2D1RenderTarget* rt,const snip::Shape& s,const Image& 
         }break;}
     default:break;
     }rt->SetTransform(previous);release(brush);
+}
+inline void renderSelectionFrame(ID2D1RenderTarget* rt,const snip::Shape& shape,float scale,bool drawing){
+    if(!snip::selectionFrameVisible(shape.tool,drawing))return;
+    auto box=shape.rawBounds();float padding=snip::selectionPadding(shape,scale);
+    ID2D1SolidColorBrush* brush=nullptr;ID2D1StrokeStyle* style=nullptr;
+    rt->CreateSolidColorBrush(rgb(0x7CE6C5,.9f),&brush);
+    auto properties=D2D1::StrokeStyleProperties();properties.dashStyle=D2D1_DASH_STYLE_DASH;
+    d2d->CreateStrokeStyle(properties,nullptr,0,&style);
+    D2D1_MATRIX_3X2_F previous;rt->GetTransform(&previous);
+    rt->SetTransform(D2D1::Matrix3x2F::Rotation(shape.rotation,pt(shape.center()))*previous);
+    if(brush)rt->DrawRectangle(rect({box.l-padding,box.t-padding,box.r+padding,box.b+padding}),brush,std::max(1.f,scale),style);
+    rt->SetTransform(previous);release(style);release(brush);
 }
 inline Image flatten(const Image& source,snip::Box selection,const std::vector<snip::Shape>& shapes){
     int x=std::max(0,int(selection.l)),y=std::max(0,int(selection.t)),w=std::min(source.width,int(selection.r))-x,h=std::min(source.height,int(selection.b))-y;

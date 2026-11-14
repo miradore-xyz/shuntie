@@ -10,13 +10,10 @@ if (-not (Test-Path -LiteralPath $ffArchive)) {
 }
 Expand-Archive -LiteralPath $ffArchive -DestinationPath (Join-Path $cache 'ffmpeg') -Force
 Copy-Item -LiteralPath (Join-Path $cache 'ffmpeg\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe') -Destination (Join-Path $bin 'ffmpeg.exe') -Force
-$gifArchive = Join-Path $cache 'gifski-1.34.0.tar.xz'
+# 下载本项目按 tools/build_gifski.ps1 构建的独立编码器组件。
+$gifArchive = Join-Path $cache 'Shuntie-Gifski-1.34.0-Windows-x64.zip'
 if (-not (Test-Path -LiteralPath $gifArchive)) {
-    Invoke-WebRequest 'https://github.com/ImageOptim/gifski/releases/download/1.34.0/gifski-1.34.0.tar.xz' -OutFile $gifArchive
+    Invoke-WebRequest 'https://github.com/miradore-xyz/shuntie/releases/download/v0.1.4/Shuntie-Gifski-1.34.0-Windows-x64.zip' -OutFile $gifArchive
 }
-$gifDir = Join-Path $cache 'gifski'
-New-Item -ItemType Directory -Force -Path $gifDir | Out-Null
-& tar -xf $gifArchive -C $gifDir
-if ($LASTEXITCODE -ne 0) { throw 'Gifski 解包失败。' }
-Copy-Item -LiteralPath (Join-Path $gifDir 'win\gifski.exe') -Destination (Join-Path $bin 'gifski.exe') -Force
+Expand-Archive -LiteralPath $gifArchive -DestinationPath $bin -Force
 Write-Output 'FFmpeg 7.1.1 和 Gifski 1.34.0 已准备完成。'

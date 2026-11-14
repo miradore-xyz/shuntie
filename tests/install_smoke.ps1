@@ -1,6 +1,8 @@
+param([string]$InstallerPath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$installer = Join-Path $projectRoot 'releases\瞬贴-0.1.3-安装.exe'
+$installer = Join-Path $projectRoot 'releases\瞬贴-0.1.4-安装.exe'
+if ($InstallerPath) { $installer = $InstallerPath }
 $installTarget = Join-Path $projectRoot 'tools\安装验证'
 $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 function Get-Startup {
@@ -19,7 +21,7 @@ try {
     Invoke-Installer ''
     $installedExe = Join-Path $installTarget '瞬贴.exe'
     $results.files_match = (Get-FileHash -LiteralPath $installedExe).Hash -eq (Get-FileHash -LiteralPath (Join-Path $projectRoot 'dist\瞬贴.exe')).Hash
-    $results.encoders_present = (Test-Path -LiteralPath (Join-Path $installTarget 'bin\ffmpeg.exe')) -and (Test-Path -LiteralPath (Join-Path $installTarget 'bin\gifski.exe'))
+    $results.encoders_present = (Test-Path -LiteralPath (Join-Path $installTarget 'bin\ffmpeg.exe')) -and (Test-Path -LiteralPath (Join-Path $installTarget 'bin\gifski.exe')) -and (Test-Path -LiteralPath (Join-Path $installTarget 'bin\gifski.dll')) -and (Test-Path -LiteralPath (Join-Path $installTarget 'bin\gifski-export.exe'))
     $startup = Get-Startup
     $results.default_autostart_enabled = $startup -eq ('"' + $installedExe + '" --tray')
     # 再次安装时取消勾选，确认也能关闭此前开启的开机启动。

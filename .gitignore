@@ -5,6 +5,9 @@
 /tools/*
 !/tools/generate_assets.py
 !/tools/fetch_dependencies.ps1
+!/tools/build_gifski.ps1
+!/tools/gnu-link.cmd
+!/tools/gnu_link.py
 /.zig-cache/
 /zig-out/
 /.serena/

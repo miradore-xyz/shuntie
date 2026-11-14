@@ -23,7 +23,10 @@ bool mergeSegments(const std::wstring& ff,const std::vector<std::wstring>& segme
     for(auto path:segments){std::replace(path.begin(),path.end(),L'\\',L'/');auto encoded=utf8(path);std::string escaped;for(char c:encoded){if(c=='\'')escaped+="'\\''";else escaped+=c;}file<<"file '"<<escaped<<"'\n";}
     file.close();Child child;bool ok=launch(child,ff,L"-hide_banner -nostdin -y -f concat -safe 0 -i "+quote(list)+L" -c copy -movflags +faststart "+quote(video),log)&&result(child)==0;DeleteFileW(list.c_str());return ok&&nonempty(video);
 }
-bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstring& video,const std::wstring& gif,const std::wstring& log,int fps){
+// 使用独立转换器保存完整色度，并复用未变化的画面。
+bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstring& video,const std::wstring& gif,const std::wstring& log,int fps,int width,int height){
+    fps=std::clamp(fps,1,50);
+    std::wstring helper=gifski.substr(0,gifski.find_last_of(L"\\/"))+L"\\gifski-export.exe";if(nonempty(helper)){Child process;return launch(process,helper,quote(ff)+L" "+quote(gifski)+L" "+quote(video)+L" "+quote(gif)+L" "+quote(log)+L" "+std::to_wstring(fps)+L" "+std::to_wstring(width)+L" "+std::to_wstring(height),log)&&result(process)==0&&nonempty(gif);}
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
     Child encoder,decoder;bool enc=launch(encoder,gifski,L"--quiet --quality 90 --fps "+std::to_wstring(fps)+L" -o "+quote(gif)+L" -",log,read);CloseHandle(read);
     bool dec=enc&&launch(decoder,ff,L"-hide_banner -nostdin -i "+quote(video)+L" -vf fps="+std::to_wstring(fps)+L" -pix_fmt yuv420p -f yuv4mpegpipe -",log,nullptr,write);CloseHandle(write);
@@ -36,7 +39,7 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps){
     SYSTEMTIME time;GetLocalTime(&time);wchar_t name[96];swprintf(name,96,L"\\录屏_%04d%02d%02d_%02d%02d%02d_%03d",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,time.wMilliseconds);
     std::wstring base=output+name,video=base+L".mp4",log=base+L".log",parts=base+L".片段";CreateDirectoryW(parts.c_str(),nullptr);
     int width=(area.right-area.left)&~1,height=(area.bottom-area.top)&~1;if(width<2||height<2){update(RecordingStatus::Failed,L"选区过小。");return;}
-    std::vector<std::wstring> segments;ULONGLONG elapsed=0;bool needCapture=true,finish=false,copy=false;int chosenBackend=-1,snapshot=0;
+    std::vector<std::wstring> segments;ULONGLONG elapsed=0;bool needCapture=true,finish=false,copy=false;int chosenBackend=-1,snapshot=0;size_t exportedSegments=0;std::wstring lastSnapshot;
     while(!finish){
         if(needCapture){
             update(RecordingStatus::Starting,L"正在启动录制…");bool captured=false;
@@ -45,8 +48,8 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps){
                 if(WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0){finish=true;break;}
                 RECT monitor{};int index=outputFor(area,monitor);bool hardware=attempt==0&&index>=0;if(attempt==0&&!hardware)continue;
                 std::wstring args=L"-hide_banner -y ",backend;
-                if(hardware){args+=L"-f lavfi -i ddagrab=output_idx="+std::to_wstring(index)+L":framerate=60:draw_mouse=1:offset_x="+std::to_wstring(area.left-monitor.left)+L":offset_y="+std::to_wstring(area.top-monitor.top)+L":video_size="+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -c:v h264_nvenc -preset p4 -tune hq -rc vbr -cq 19 -b:v 0 ";backend=L"显卡捕获 · NVIDIA 硬件编码";}
-                else{args+=L"-f gdigrab -framerate 60 -draw_mouse 1 -offset_x "+std::to_wstring(area.left)+L" -offset_y "+std::to_wstring(area.top)+L" -video_size "+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -i desktop -vf format=yuv420p -c:v libx264 -preset ultrafast -crf 18 ";backend=L"兼容捕获 · 软件编码";}
+                if(hardware){args+=L"-f lavfi -i ddagrab=output_idx="+std::to_wstring(index)+L":framerate=60:draw_mouse=1:offset_x="+std::to_wstring(area.left-monitor.left)+L":offset_y="+std::to_wstring(area.top-monitor.top)+L":video_size="+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -c:v h264_nvenc -preset p1 -tune lossless -rc constqp -qp 0 -rgb_mode yuv444 -profile:v high444p ";backend=L"显卡捕获 · NVIDIA 硬件编码";}
+                else{args+=L"-f gdigrab -framerate 60 -draw_mouse 1 -offset_x "+std::to_wstring(area.left)+L" -offset_y "+std::to_wstring(area.top)+L" -video_size "+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -i desktop -c:v libx264rgb -preset ultrafast -crf 0 ";backend=L"兼容捕获 · 软件编码";}
                 args+=L"-an -fps_mode cfr -r 60 -movflags +faststart "+quote(segment);
                 Child child;ULONGLONG began=GetTickCount64();if(!launch(child,ff,args,log))continue;
                 if(WaitForSingleObject(child.process.hProcess,1000)==WAIT_OBJECT_0)continue;
@@ -64,7 +67,7 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps){
         if(finish)break;
         if(copy){
             update(RecordingStatus::Exporting,L"正在生成并复制 GIF…");std::wstring gif=base+L"_快照"+std::to_wstring(++snapshot)+L".gif";
-            bool ok=mergeSegments(ff,segments,video,log)&&encodeGif(ff,gifski,video,gif,log,fps);
+            bool ok=mergeSegments(ff,segments,video,log)&&encodeGif(ff,gifski,video,gif,log,fps,width,height);if(ok){exportedSegments=segments.size();lastSnapshot=gif;}
             {std::lock_guard<std::mutex> lock(mutex);if(ok){current.gif=gif;++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"GIF 已生成，录制保持暂停":L"GIF 导出失败，可重试或继续录制";}
             copy=false;
         }else update(RecordingStatus::Paused,L"已暂停");
@@ -73,7 +76,8 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps){
     }
     if(segments.empty()){RemoveDirectoryW(parts.c_str());update(RecordingStatus::Idle,L"已取消录制");return;}
     update(RecordingStatus::Exporting,L"正在保存视频并导出 GIF…");std::wstring gif=base+L".gif";
-    if(!mergeSegments(ff,segments,video,log)||!encodeGif(ff,gifski,video,gif,log,fps)){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
+    bool ready=exportedSegments==segments.size()&&!lastSnapshot.empty()&&nonempty(video)&&CopyFileW(lastSnapshot.c_str(),gif.c_str(),FALSE);
+    if(!ready&&(!mergeSegments(ff,segments,video,log)||!encodeGif(ff,gifski,video,gif,log,fps,width,height))){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
     // 成功输出完整视频和 GIF 后才清理本次会话的片段文件。
     for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
     {std::lock_guard<std::mutex> lock(mutex);current.gif=gif;current.video=video;current.phase=RecordingStatus::Complete;current.message=L"GIF 已导出";}

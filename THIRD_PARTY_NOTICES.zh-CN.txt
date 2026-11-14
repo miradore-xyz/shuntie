@@ -1,4 +1,4 @@
-瞬贴 0.1.3
+瞬贴 0.1.4
 
 界面图标：Lucide（ISC 许可）
 https://github.com/lucide-icons/lucide
@@ -11,5 +11,8 @@ FFmpeg 7.1.1 essentials（Gyan 构建，GPL 构建）
 
 Gifski 1.34.0（AGPL 许可）
 https://github.com/ImageOptim/gifski/tree/1.34.0
+本包的 GNU 构建可通过 tools/build_gifski.ps1 复现。
+独立转换器 gifski-export.exe 的源码位于 third_party/gifski-export.cpp，遵循 AGPL-3.0-or-later；与主程序通过命令行和普通视频、GIF 文件交互。
+Rust 标准库及 LLVM-MinGW 运行组件许可保存在 licenses 中。编码组件不需要单独安装 VC++ 运行库。
 
 这些程序作为独立进程使用。外部编码器使整套软件的大小明显大于主程序。

@@ -43,7 +43,7 @@ inline std::wstring localize(std::wstring value){
     };
     // 先匹配完整文本；动态数字和快捷键再使用前缀、后缀替换。
     for(auto& item:dictionary){const wchar_t* from=english?item.first:item.second;const wchar_t* to=english?item.second:item.first;if(value==from)return to;}
-    if(!english){for(auto& item:dictionary){std::wstring from=item.second;if(from.size()<4)continue;size_t pos=0;while((pos=value.find(from,pos))!=std::wstring::npos){value.replace(pos,from.size(),item.first);pos+=wcslen(item.first);}}return value;}
+    if(!english){for(auto& item:dictionary){std::wstring from=item.second;size_t pos=0;while((pos=value.find(from,pos))!=std::wstring::npos){value.replace(pos,from.size(),item.first);pos+=wcslen(item.first);}}return value;}
     for(auto& item:dictionary){std::wstring from=item.first;size_t pos=0;while((pos=value.find(from,pos))!=std::wstring::npos){value.replace(pos,from.size(),item.second);pos+=wcslen(item.second);}}
     return value;
 }

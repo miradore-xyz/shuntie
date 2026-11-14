@@ -32,12 +32,29 @@ struct Shape {
     Point center() const {auto b=rawBounds();return {(b.l+b.r)/2,(b.t+b.b)/2};}
     Point toWorld(Point p) const {return rotate(p,center(),rotation);}
     Point toLocal(Point p) const {return rotate(p,center(),-rotation);}
-    Point resizeHandle() const {auto b=rawBounds();return toWorld({b.r,b.b});}
-    Point rotateHandle(float gap) const {auto b=rawBounds();return toWorld({(b.l+b.r)/2,b.t-gap});}
+    Point resizeHandle(float padding=0) const {auto b=rawBounds();return toWorld({b.r+padding,b.b+padding});}
+    Point rotateHandle(float gap,float padding=0) const {auto b=rawBounds();return toWorld({(b.l+b.r)/2,b.t-padding-gap});}
     Box bounds() const {auto b=rawBounds();Point points[]={toWorld({b.l,b.t}),toWorld({b.r,b.t}),toWorld({b.r,b.b}),toWorld({b.l,b.b})};Box out{points[0].x,points[0].y,points[0].x,points[0].y};for(auto p:points){out.l=std::min(out.l,p.x);out.r=std::max(out.r,p.x);out.t=std::min(out.t,p.y);out.b=std::max(out.b,p.y);}return out;}
     void resizeTo(Point world){auto box=rawBounds();auto anchor=toWorld({box.l,box.t});Point q=rotate(world,anchor,-rotation);float sx=std::max(4.f,q.x-anchor.x)/std::max(1.f,box.width()),sy=std::max(4.f,q.y-anchor.y)/std::max(1.f,box.height());auto scale=[&](Point& p){p.x=box.l+(p.x-box.l)*sx;p.y=box.t+(p.y-box.t)*sy;};scale(a);scale(b);for(auto& p:points)scale(p);auto after=toWorld({box.l,box.t});move(anchor.x-after.x,anchor.y-after.y);}
     void move(float x,float y){ a.x+=x;a.y+=y;b.x+=x;b.y+=y;for(auto& p:points){p.x+=x;p.y+=y;} }
 };
+// 只在画笔落笔期间隐藏选中框，移动、缩放和旋转时仍保持可见。
+inline bool selectionFrameVisible(Tool tool,bool drawing){return tool!=Tool::Pen||!drawing;}
+inline float selectionPadding(const Shape& shape,float scale){return std::max(4.f*scale,shape.stroke*.5f+2.f*scale);}
+inline int areaHandle(Box b,Point p,float tolerance){
+    Point handles[]={{b.l,b.t},{(b.l+b.r)/2,b.t},{b.r,b.t},{b.r,(b.t+b.b)/2},{b.r,b.b},{(b.l+b.r)/2,b.b},{b.l,b.b},{b.l,(b.t+b.b)/2}};
+    for(int i=0;i<8;++i)if(std::hypot(p.x-handles[i].x,p.y-handles[i].y)<=tolerance)return i;
+    if(p.x>=b.l&&p.x<=b.r){if(std::abs(p.y-b.t)<=tolerance)return 1;if(std::abs(p.y-b.b)<=tolerance)return 5;}
+    if(p.y>=b.t&&p.y<=b.b){if(std::abs(p.x-b.l)<=tolerance)return 7;if(std::abs(p.x-b.r)<=tolerance)return 3;}return -1;
+}
+inline Box resizeArea(Box original,int handle,Point p,float width,float height){
+    Box b=original;float minW=std::min(8.f,b.width()),minH=std::min(8.f,b.height());
+    if(handle==0||handle==6||handle==7)b.l=std::clamp(p.x,0.f,b.r-minW);
+    if(handle==2||handle==3||handle==4)b.r=std::clamp(p.x,b.l+minW,width);
+    if(handle==0||handle==1||handle==2)b.t=std::clamp(p.y,0.f,b.b-minH);
+    if(handle==4||handle==5||handle==6)b.b=std::clamp(p.y,b.t+minH,height);
+    return b;
+}
 inline float segmentDistance(Point p,Point a,Point b) {
     float x=b.x-a.x,y=b.y-a.y, d=x*x+y*y;
     float t=d>0?std::clamp(((p.x-a.x)*x+(p.y-a.y)*y)/d,0.f,1.f):0;

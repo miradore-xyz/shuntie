@@ -16,6 +16,7 @@
 #include "graphics.hpp"
 #include "recorder.hpp"
 #include "icons.hpp"
+#include "window_snap.hpp"
 #include <fstream>
 
 namespace {
@@ -54,8 +55,8 @@ float tipScale=1;
 std::wstring timestamp(const wchar_t* suffix){SYSTEMTIME t;GetLocalTime(&t);wchar_t b[128];swprintf(b,128,L"\\截图_%04d%02d%02d_%02d%02d%02d_%03d%s",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,suffix);return outputDir+b;}
 void message(const std::wstring& value){notice=value;InvalidateRect(mainWindow,nullptr,FALSE);}
 void showError(HWND owner,const std::wstring& value){auto translated=localize(value);MessageBoxW(owner,translated.c_str(),english?L"Shuntie":L"瞬贴",MB_OK|MB_ICONWARNING);}
-HWND button(HWND parent,int id,const wchar_t* label,int x,int y,int w,int h){
-    auto translated=localize(label);HWND b=CreateWindowExW(0,L"BUTTON",translated.c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,x,y,w,h,parent,reinterpret_cast<HMENU>(INT_PTR(id)),instance,nullptr);
+HWND button(HWND parent,int id,const wchar_t* label,int x,int y,int w,int h,bool visible=true){
+    auto translated=localize(label);HWND b=CreateWindowExW(0,L"BUTTON",translated.c_str(),WS_CHILD|(visible?WS_VISIBLE:0)|WS_TABSTOP|BS_OWNERDRAW,x,y,w,h,parent,reinterpret_cast<HMENU>(INT_PTR(id)),instance,nullptr);
     SendMessageW(b,WM_SETFONT,reinterpret_cast<WPARAM>(uiFont),TRUE);SetWindowSubclass(b,hoverProc,1,0);return b;
 }
 void drawButton(DRAWITEMSTRUCT* d){
@@ -126,6 +127,10 @@ struct Editor {
     Image screen;RECT desktop{};snip::Box selection{};snip::Tool tool=snip::Tool::Rectangle;
     std::vector<snip::Shape> shapes;std::vector<std::vector<snip::Shape>> past,future;
     bool selected=false,recording=false,dragging=false,selecting=false,moving=false,resizing=false,rotating=false;
+    bool adjustingArea=false,hoverSnap=false,toolbarVisible=false;
+    int areaEdge=-1;
+    snip::Box areaBefore,hoverSelection;
+    std::vector<SnapWindow> snapWindows;
     float initialRotation=0,initialPolar=0;
     int active=-1,colorIndex=0,widthIndex=0;snip::Point start,last;float stroke=3;
     ID2D1HwndRenderTarget* rt=nullptr;ID2D1Bitmap* background=nullptr;
@@ -134,7 +139,7 @@ struct Editor {
     void checkpoint(){past.push_back(shapes);if(past.size()>60)past.erase(past.begin());future.clear();}
     void history(bool redo){auto& from=redo?future:past;auto& to=redo?past:future;if(from.empty())return;to.push_back(shapes);shapes=from.back();from.pop_back();active=-1;}
 } editor;
-bool isEditorStrip(HWND b){return GetParent(b)==overlay&&!editor.recording;}
+bool isEditorStrip(HWND b){HWND parent=GetParent(b);return parent&&(parent==overlay||parent==recordPanel);}
 bool isToolSelected(int id){return overlay&&!editor.recording&&((id==Select&&editor.tool==snip::Tool::Select)||(id==Rectangle&&editor.tool==snip::Tool::Rectangle)||(id==Arrow&&editor.tool==snip::Tool::Arrow)||(id==Pen&&editor.tool==snip::Tool::Pen)||(id==Mosaic&&editor.tool==snip::Tool::Mosaic));}
 const unsigned colors[]={0xFF6554,0xFF9D57,0xFFCF4A,0x7CE6C5,0x3478F6,0xA58BFA,0xF472B6,0xFFFFFF,0xAFB7C1,0x64748B,0x007F78,0x182B35};
 HWND paletteWindow=nullptr;
@@ -151,12 +156,17 @@ void showPalette(){if(paletteWindow){DestroyWindow(paletteWindow);return;}RECT r
 #include "stroke_popup.inl"
 
 void layoutToolbar(){
-    int total=editor.recording?3:int(editor.toolbar.size()),gap=int(4*mainScale),h=int(40*mainScale),w=editor.recording?int(120*mainScale):int(40*mainScale);
+    editor.toolbarVisible=true;
+    int total=int(editor.toolbar.size()),gap=int(4*mainScale),h=int(40*mainScale),w=int(40*mainScale);
     int separator=editor.recording?0:int(8*mainScale),panelW=total*(w+gap)+gap+4*separator;int left=std::clamp(int((editor.selection.l+editor.selection.r)/2)-panelW/2,10,std::max(10,editor.screen.width-panelW-10));
     int top=int(editor.selection.b)+12;if(top+h+32>editor.screen.height)top=std::max(8,int(editor.selection.t)-h-40);
     editor.toolbarBounds={left-gap,top-gap,left+panelW+gap,top+h+gap};
-    int offset=gap;for(int i=0;i<int(editor.toolbar.size());++i){SetWindowPos(editor.toolbar[i],nullptr,left+offset,top,w,h,SWP_NOZORDER|SWP_SHOWWINDOW);offset+=w+gap;if(i==4||i==6||i==8||i==12)offset+=separator;}
+    // 隐藏创建控件，批量提交位置与可见性，避免逐个弹出及中途重绘。
+    HDWP positions=BeginDeferWindowPos(total);int offset=gap;
+    for(int i=0;i<total;++i){positions=DeferWindowPos(positions,editor.toolbar[i],nullptr,left+offset,top,w,h,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_SHOWWINDOW);offset+=w+gap;if(i==4||i==6||i==8||i==12)offset+=separator;}
+    if(positions)EndDeferWindowPos(positions);
     if(editor.hint)ShowWindow(editor.hint,SW_HIDE);
+    RedrawWindow(overlay,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN|RDW_NOERASE);
 }
 void toolHint(){
     if(!editor.hint)return;std::wstring value;
@@ -167,10 +177,10 @@ void toolHint(){
 }
 void createToolbar(){
     if(!editor.toolbar.empty()){layoutToolbar();return;}
-    if(editor.recording){editor.toolbar.push_back(button(overlay,StartRecord,L"开始录制",0,0,0,0));editor.toolbar.push_back(button(overlay,Reselect,L"重新框选",0,0,0,0));editor.toolbar.push_back(button(overlay,Cancel,L"取消",0,0,0,0));}
+    if(editor.recording){editor.toolbar.push_back(button(overlay,StartRecord,L"开始录制",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Reselect,L"重新框选",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Cancel,L"取消",0,0,0,0,false));}
     else{
         const std::pair<int,const wchar_t*> entries[]={{Select,L"选择（V）"},{Rectangle,L"方框（R）"},{Arrow,L"箭头（A）"},{Pen,L"画笔（P）"},{Mosaic,L"马赛克（M）"},{Color,L"颜色：红色"},{Thickness,L"线宽：3"},{Undo,L"撤销（Ctrl+Z）"},{Redo,L"重做（Ctrl+Y）"},{Copy,L"复制截图（Enter）"},{Save,L"保存（Ctrl+S）"},{Pin,L"贴图"},{StartRecord,L"录制选区"},{Reselect,L"重新框选"},{Cancel,L"取消（Esc）"}};
-        for(auto e:entries)editor.toolbar.push_back(button(overlay,e.first,e.second,0,0,0,0));
+        for(auto e:entries)editor.toolbar.push_back(button(overlay,e.first,e.second,0,0,0,0,false));
     }
     editor.hint=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT,0,0,0,0,overlay,nullptr,instance,nullptr);SendMessageW(editor.hint,WM_SETFONT,reinterpret_cast<WPARAM>(uiFont),TRUE);
     layoutToolbar();toolHint();
@@ -179,17 +189,18 @@ void paintEditor(HWND hwnd){
     PAINTSTRUCT paint;BeginPaint(hwnd,&paint);
     if(!editor.rt){editor.rt=createTarget(hwnd);if(editor.rt)editor.background=bitmapFor(editor.rt,editor.screen);}
     auto rt=editor.rt;if(rt){rt->BeginDraw();rt->Clear(rgb(INK));if(editor.background)rt->DrawBitmap(editor.background);
-        auto s=editor.selection;float sw=float(editor.screen.width),sh=float(editor.screen.height);
-        if(editor.selected||editor.dragging){
+        auto s=editor.hoverSnap&&!editor.selected&&!editor.dragging?editor.hoverSelection:editor.selection;float sw=float(editor.screen.width),sh=float(editor.screen.height);
+        if(editor.selected||editor.dragging||editor.hoverSnap){
             fill(rt,{0,0,sw,s.t},0,0.52f);fill(rt,{0,s.t,s.l,s.b},0,.52f);fill(rt,{s.r,s.t,sw,s.b},0,.52f);fill(rt,{0,s.b,sw,sh},0,.52f);
             rt->PushAxisAlignedClip(rect(s),D2D1_ANTIALIAS_MODE_ALIASED);for(auto& shape:editor.shapes)renderShape(rt,shape,editor.screen);rt->PopAxisAlignedClip();
             ID2D1SolidColorBrush* brush=nullptr;rt->CreateSolidColorBrush(rgb(0x40DFCB),&brush);if(brush){rt->DrawRectangle(rect(s),brush,2);release(brush);}
+            if(editor.selected){snip::Point handles[]={{s.l,s.t},{(s.l+s.r)/2,s.t},{s.r,s.t},{s.r,(s.t+s.b)/2},{s.r,s.b},{(s.l+s.r)/2,s.b},{s.l,s.b},{s.l,(s.t+s.b)/2}};float half=3*mainScale;for(auto handle:handles)fill(rt,{handle.x-half,handle.y-half,handle.x+half,handle.y+half},0xECF0F3);}
             std::wstring size=std::to_wstring(int(s.width()))+L" × "+std::to_wstring(int(s.height()));
             float labelY=s.t>=34?s.t-32:s.t+6;fill(rt,{s.l,labelY,s.l+150,labelY+28},0x20262E,.98f);text(rt,size,{s.l+8,labelY+2,s.l+148,labelY+28},17,0xECF0F3);
-            if(editor.active>=0&&editor.active<int(editor.shapes.size())&&(!editor.dragging||editor.moving||editor.resizing||editor.rotating)){auto& shape=editor.shapes[editor.active];auto b=shape.rawBounds();auto resize=shape.resizeHandle(),rotate=shape.rotateHandle(28*mainScale),top=shape.toWorld({(b.l+b.r)/2,b.t});
+            if(editor.active>=0&&editor.active<int(editor.shapes.size())&&snip::selectionFrameVisible(editor.shapes[editor.active].tool,editor.dragging&&!editor.moving&&!editor.resizing&&!editor.rotating&&!editor.adjustingArea)){auto& shape=editor.shapes[editor.active];bool drawing=editor.dragging&&!editor.moving&&!editor.resizing&&!editor.rotating&&!editor.adjustingArea;renderSelectionFrame(rt,shape,mainScale,drawing);auto b=shape.rawBounds();float padding=snip::selectionPadding(shape,mainScale);auto resize=shape.resizeHandle(padding),rotate=shape.rotateHandle(28*mainScale,padding),top=shape.toWorld({(b.l+b.r)/2,b.t-padding});
                 rt->CreateSolidColorBrush(rgb(0xB4C4CC),&brush);if(brush){rt->DrawLine(pt(top),pt(rotate),brush,1);brush->SetColor(rgb(ACCENT));rt->FillEllipse(D2D1::Ellipse(pt(resize),3.5f*mainScale,3.5f*mainScale),brush);rt->DrawEllipse(D2D1::Ellipse(pt(rotate),4*mainScale,4*mainScale),brush,1.5f);release(brush);}}
         }else{fill(rt,{0,0,sw,sh},0,.42f);fill(rt,{sw/2-280,70,sw/2+280,160},0x20262E,.98f);text(rt,editor.recording?L"框选录制区域":L"拖动鼠标，截取一块屏幕",{sw/2-255,84,sw/2+255,125},25,0xFFFFFF,true);text(rt,L"按 Esc 取消 · 支持跨屏截图",{sw/2-255,127,sw/2+255,158},16,0xBDD4D8);}
-        if(editor.selected&&!editor.toolbar.empty()){auto b=editor.toolbarBounds;ID2D1SolidColorBrush* bar=nullptr;rt->CreateSolidColorBrush(rgb(0x20262E),&bar);if(bar){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(float(b.left),float(b.top),float(b.right),float(b.bottom)),10*mainScale,10*mainScale),bar);if(!editor.recording){bar->SetColor(rgb(0x46515E));for(int index:{4,6,8,12}){RECT r;GetWindowRect(editor.toolbar[index],&r);int x=r.right-editor.desktop.left+int(6*mainScale);rt->DrawLine({float(x),float(b.top)+12*mainScale},{float(x),float(b.bottom)-12*mainScale},bar,1);}}release(bar);}}
+        if(editor.selected&&editor.toolbarVisible&&!editor.toolbar.empty()){auto b=editor.toolbarBounds;ID2D1SolidColorBrush* bar=nullptr;rt->CreateSolidColorBrush(rgb(0x20262E),&bar);if(bar){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(float(b.left),float(b.top),float(b.right),float(b.bottom)),10*mainScale,10*mainScale),bar);if(!editor.recording){bar->SetColor(rgb(0x46515E));for(int index:{4,6,8,12}){RECT r;GetWindowRect(editor.toolbar[index],&r);int x=r.right-editor.desktop.left+int(6*mainScale);rt->DrawLine({float(x),float(b.top)+12*mainScale},{float(x),float(b.bottom)-12*mainScale},bar,1);}}release(bar);}}
         if(FAILED(rt->EndDraw())){release(editor.background);release(editor.rt);}
     }EndPaint(hwnd,&paint);
 }
@@ -201,11 +212,13 @@ void editorCommand(int id){
     case Thickness:showStroke();return;
     case Undo:editor.history(false);break;case Redo:editor.history(true);break;
     case Copy:case Save:case Pin:case StartRecord:finishCapture(id);return;
-    case Reselect:editor.selected=false;editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;for(HWND b:editor.toolbar)ShowWindow(b,SW_HIDE);ShowWindow(editor.hint,SW_HIDE);break;
+    case Reselect:editor.toolbarVisible=false;editor.hoverSnap=false;editor.selected=false;editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;for(HWND b:editor.toolbar)ShowWindow(b,SW_HIDE);ShowWindow(editor.hint,SW_HIDE);break;
     case Cancel:DestroyWindow(overlay);return;
     }
     if(overlay){SetFocus(overlay);InvalidateRect(overlay,nullptr,FALSE);}
 }
+#include "editor_input.inl"
+
 LRESULT CALLBACK overlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     snip::Point p{float(GET_X_LPARAM(lp)),float(GET_Y_LPARAM(lp))};
     switch(msg){
@@ -214,35 +227,11 @@ LRESULT CALLBACK overlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_NOTIFY:if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){auto tip=reinterpret_cast<NMTTDISPINFOW*>(lp);static wchar_t title[160];GetWindowTextW(reinterpret_cast<HWND>(tip->hdr.idFrom),title,160);tip->lpszText=title;return 0;}break;
     case WM_CTLCOLORSTATIC:{auto dc=reinterpret_cast<HDC>(wp);SetTextColor(dc,RGB(255,255,255));SetBkColor(dc,RGB(24,43,53));static HBRUSH brush=CreateSolidBrush(RGB(24,43,53));return reinterpret_cast<LRESULT>(brush);}
     case WM_COMMAND:editorCommand(LOWORD(wp));return 0;
-    case WM_LBUTTONDOWN:{SetFocus(hwnd);
-        editor.last=p;editor.start=p;editor.dragging=true;editor.moving=false;editor.resizing=false;editor.rotating=false;editor.selecting=!editor.selected;
-        if(editor.selecting)editor.selection=snip::normalized(p,p);
-        else if(editor.selection.contains(p)&&!editor.recording){
-            if(editor.tool==snip::Tool::Select){
-                bool handle=false,rotationHandle=false;if(editor.active>=0){auto& shape=editor.shapes[editor.active];auto resize=shape.resizeHandle(),rotate=shape.rotateHandle(28*mainScale);handle=std::hypot(p.x-resize.x,p.y-resize.y)<12*mainScale;rotationHandle=std::hypot(p.x-rotate.x,p.y-rotate.y)<12*mainScale;}
-                if(rotationHandle){editor.checkpoint();editor.rotating=true;auto& shape=editor.shapes[editor.active];auto c=shape.center();editor.initialRotation=shape.rotation;editor.initialPolar=std::atan2(p.y-c.y,p.x-c.x);}
-                else if(handle){editor.checkpoint();editor.resizing=true;}
-                else{editor.active=-1;for(int i=int(editor.shapes.size())-1;i>=0;--i)if(snip::hit(editor.shapes[i],p)){editor.active=i;break;}
-                    if(editor.active>=0){editor.checkpoint();editor.moving=true;}}
-            }else{editor.checkpoint();snip::Shape s;s.tool=editor.tool;s.a=p;s.b=p;s.color=colors[editor.colorIndex];s.stroke=editor.stroke;if(s.tool==snip::Tool::Pen)s.points.push_back(p);editor.shapes.push_back(s);editor.active=int(editor.shapes.size())-1;}
-        }else editor.dragging=false;
-        if(editor.dragging)SetCapture(hwnd);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
-    case WM_MOUSEMOVE:if(editor.dragging){
-        p.x=std::clamp(p.x,0.f,float(editor.screen.width));p.y=std::clamp(p.y,0.f,float(editor.screen.height));
-        if(editor.selecting)editor.selection=snip::normalized(editor.start,p);
-        else if(editor.active>=0){p.x=std::clamp(p.x,editor.selection.l,editor.selection.r);p.y=std::clamp(p.y,editor.selection.t,editor.selection.b);auto& s=editor.shapes[editor.active];
-            if(editor.moving){auto b=s.bounds();float dx=b.width()<=editor.selection.width()?std::clamp(p.x-editor.last.x,editor.selection.l-b.l,editor.selection.r-b.r):0,dy=b.height()<=editor.selection.height()?std::clamp(p.y-editor.last.y,editor.selection.t-b.t,editor.selection.b-b.b):0;s.move(dx,dy);}
-            else if(editor.rotating){auto c=s.center();s.rotation=editor.initialRotation+(std::atan2(p.y-c.y,p.x-c.x)-editor.initialPolar)*57.29577951f;if(GetKeyState(VK_SHIFT)<0)s.rotation=std::round(s.rotation/15)*15;}
-            else if(editor.resizing){s.resizeTo(p);}else if(editor.tool!=snip::Tool::Select){s.b=p;if(s.tool==snip::Tool::Pen)s.points.push_back(p);}
-        }editor.last=p;InvalidateRect(hwnd,nullptr,FALSE);
-    }return 0;
-    case WM_LBUTTONUP:if(editor.dragging){ReleaseCapture();editor.dragging=false;
-        if(editor.selecting){if(editor.selection.width()<=6&&editor.selection.height()<=6){editor.selection={0,0,float(editor.screen.width),float(editor.screen.height)};}if(editor.selection.width()>6&&editor.selection.height()>6){editor.selected=true;createToolbar();}else editor.selected=false;}
-        else if(editor.active>=0&&!editor.moving&&!editor.resizing&&editor.tool!=snip::Tool::Select){auto b=editor.shapes[editor.active].bounds();if(b.width()<2&&b.height()<2){editor.shapes.pop_back();editor.active=-1;}else{editor.tool=snip::Tool::Select;toolHint();for(HWND button:editor.toolbar)InvalidateRect(button,nullptr,FALSE);}}
-        InvalidateRect(hwnd,nullptr,FALSE);
-    }return 0;
+    case WM_LBUTTONDOWN:editorMouseDown(hwnd,p);return 0;
+    case WM_MOUSEMOVE:editorMouseMove(hwnd,p);return 0;
+    case WM_LBUTTONUP:editorMouseUp(hwnd);return 0;
     case WM_RBUTTONUP:editorCommand(Cancel);return 0;
-    case WM_SETCURSOR:if(editor.selected){POINT pos;GetCursorPos(&pos);ScreenToClient(hwnd,&pos);snip::Point point{float(pos.x),float(pos.y)};if(editor.active>=0){auto& shape=editor.shapes[editor.active];auto resize=shape.resizeHandle(),rotate=shape.rotateHandle(28*mainScale);if(std::hypot(point.x-rotate.x,point.y-rotate.y)<12*mainScale){SetCursor(LoadCursorW(nullptr,IDC_CROSS));return TRUE;}if(std::hypot(point.x-resize.x,point.y-resize.y)<12*mainScale){SetCursor(LoadCursorW(nullptr,IDC_SIZENWSE));return TRUE;}}if(editor.tool==snip::Tool::Select){for(auto& s:editor.shapes)if(snip::hit(s,point)){SetCursor(LoadCursorW(nullptr,IDC_SIZEALL));return TRUE;}}}break;
+    case WM_SETCURSOR:if(editorCursor(hwnd))return TRUE;break;
     case WM_KEYDOWN:
         if(wp==VK_ESCAPE){editorCommand(Cancel);return 0;}
         if(wp==VK_RETURN&&editor.selected){finishCapture(editor.recording?StartRecord:Copy);return 0;}
@@ -254,9 +243,10 @@ LRESULT CALLBACK overlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 }
 void beginCapture(bool recording){
     if(overlay){SetForegroundWindow(overlay);return;}if(recording&&recorder.busy()){showMain();return;}
-    ShowWindow(mainWindow,SW_HIDE);Sleep(160);DwmFlush();
-    editor.screen={};release(editor.background);release(editor.rt);editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;editor.selected=false;editor.recording=recording;editor.dragging=false;editor.tool=snip::Tool::Rectangle;editor.toolbar.clear();editor.hint=nullptr;
+    hideTip();ShowWindow(mainWindow,SW_HIDE);Sleep(160);DwmFlush();
+    editor.screen={};release(editor.background);release(editor.rt);editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;editor.selected=false;editor.recording=recording;editor.dragging=false;editor.tool=snip::Tool::Rectangle;editor.toolbar.clear();editor.hint=nullptr;editor.adjustingArea=false;editor.toolbarVisible=false;editor.hoverSnap=false;editor.snapWindows=captureSnapWindows();
     int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN),w=GetSystemMetrics(SM_CXVIRTUALSCREEN),h=GetSystemMetrics(SM_CYVIRTUALSCREEN);editor.desktop={x,y,x+w,y+h};editor.screen=captureDesktop(editor.desktop);
+    POINT hover;GetCursorPos(&hover);editor.hoverSelection=snapAt(editor.snapWindows,hover,editor.desktop);editor.hoverSnap=true;
     if(!editor.screen.valid()){showMain();showError(mainWindow,L"无法读取屏幕。请确认桌面没有锁定。");return;}
     overlay=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"ShuntieEditor",recording?L"瞬贴 · 框选录屏":L"瞬贴 · 截图标注",WS_POPUP|WS_CLIPCHILDREN,x,y,w,h,nullptr,nullptr,instance,nullptr);
     if(!overlay){showMain();return;}ShowWindow(overlay,SW_SHOW);SetForegroundWindow(overlay);SetFocus(overlay);
@@ -271,7 +261,7 @@ void finishCapture(int action){
         DestroyWindow(overlay);ShowWindow(mainWindow,SW_HIDE);recorder.start(area,root,outputDir,fps);beginRecordingUI(area);return;
     }
     Image im=flatten(editor.screen,editor.selection,editor.shapes);if(!im.valid()){showError(overlay,L"截图生成失败，请重试。");return;}
-    if(action==Copy){if(!copyImage(overlay,im)){showError(overlay,L"剪贴板暂时被其他程序占用，请再试一次。");return;}message(L"截图已复制到剪贴板。");}
+    if(action==Copy){if(!copyImage(mainWindow,im)){showError(overlay,L"剪贴板暂时被其他程序占用，请再试一次。");return;}message(L"截图已复制到剪贴板。");}
     if(action==Save){
         std::wstring initial=timestamp(L".png");wchar_t file[32768]{};wcsncpy(file,initial.c_str(),32767);OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=overlay;dialog.lpstrFilter=english?L"PNG image\0*.png\0\0":L"PNG 图片\0*.png\0\0";dialog.lpstrFile=file;dialog.nMaxFile=32768;dialog.lpstrDefExt=L"png";dialog.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
         if(!GetSaveFileNameW(&dialog))return;if(!savePng(im,file)){showError(overlay,L"保存失败，请检查目标目录。");return;}message(L"截图已保存为 PNG。");
@@ -303,7 +293,7 @@ LRESULT CALLBACK settingsProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{auto add=[&](int id,const wchar_t* label,int x,int y,int w,int h){button(hwnd,id,label,int(x*s),int(y*s),int(w*s),int(h*s));};add(Back,L"关闭设置",286,18,34,34);add(Language,english?L"简体中文":L"English",200,60,120,25);add(KeyCapture,L"截图",24,92,252,40);add(KeyPin,L"贴图",24,140,252,40);add(KeyRecord,L"录屏",24,188,252,40);add(ClearCapture,L"清除截图快捷键",284,92,36,40);add(ClearPin,L"清除贴图快捷键",284,140,36,40);add(ClearRecord,L"清除录屏快捷键",284,188,36,40);add(FpsToggle,L"GIF 帧率",24,252,296,40);add(AutoStart,L"开机启动",24,300,296,40);add(Folder,L"输出目录",24,364,140,38);add(Hide,L"收起",180,364,140,38);add(Exit,L"退出软件",24,418,296,38);return 0;}
     case WM_DRAWITEM:drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));return TRUE;
-    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());EnumChildWindows(mainWindow,[](HWND control,LPARAM)->BOOL{wchar_t label[256]{};GetWindowTextW(control,label,256);setLabel(control,label);return TRUE;},0);setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearRecord){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyRecord){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==30?60:30;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
+    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());EnumChildWindows(mainWindow,[](HWND control,LPARAM)->BOOL{wchar_t label[256]{};GetWindowTextW(control,label,256);setLabel(control,label);return TRUE;},0);setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearRecord){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyRecord){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==30?50:30;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
     case WM_SYSKEYDOWN:case WM_KEYDOWN:
         if(waitingHotkey){if(wp==VK_ESCAPE){waitingHotkey=0;settingsLabels();return 0;}if(wp==VK_CONTROL||wp==VK_SHIFT||wp==VK_MENU||wp==VK_LWIN||wp==VK_RWIN)return 0;
         int i=waitingHotkey-1;UINT mod=(GetKeyState(VK_CONTROL)<0?MOD_CONTROL:0)|(GetKeyState(VK_MENU)<0?MOD_ALT:0)|(GetKeyState(VK_SHIFT)<0?MOD_SHIFT:0);UINT oldKey=keyCodes[i],oldMod=keyModifiers[i];UnregisterHotKey(mainWindow,i+1);
@@ -353,7 +343,7 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:{PAINTSTRUCT paint;BeginPaint(hwnd,&paint);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(mainScale,mainScale));rt->Clear(rgb(BG));
         // 统一使用嵌入的高清 Logo，图标资源包含 16 到 256 像素尺寸。
         if(!logo)logo=bitmapFor(rt,brandImage,true);if(logo)rt->DrawBitmap(logo,D2D1::RectF(20,17,70,67),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.3",{83,50,240,69},10,MUTED);
+        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.4",{83,50,240,69},10,MUTED);
         text(rt,L"截图、标注、贴图。",{24,87,320,116},19,INK);
         text(rt,L"录下操作，一键复制 GIF。",{24,118,320,148},14,MUTED);
         auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,166,320,167},0x2C333C);text(rt,notice.empty()?L"GIF 已导出":notice,{24,180,320,208},12,ACCENT);}
@@ -403,7 +393,7 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR args,int){
     DWORD style=WS_POPUP|WS_CLIPCHILDREN;
     RECT work;SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);int w=int(344*mainScale),he=int(180*mainScale);
     mainWindow=CreateWindowExW(0,L"ShuntieMain",L"瞬贴 · 截图与录屏",style,(work.right-w)/2,(work.bottom-he)/2,w,he,nullptr,nullptr,h,nullptr);if(!mainWindow)return 1;setLabel(mainWindow,L"瞬贴 · 截图与录屏");
-    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<3;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}gifFps=GetPrivateProfileIntW(L"export",L"fps",30,ini.c_str())==60?60:30;registerKeys();roundWindow(mainWindow);
+    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<3;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}gifFps=GetPrivateProfileIntW(L"export",L"fps",30,ini.c_str())>30?50:30;registerKeys();roundWindow(mainWindow);
     tray.cbSize=sizeof(tray);tray.hWnd=mainWindow;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;tray.uCallbackMessage=TRAY_MESSAGE;tray.hIcon=smallIcon?smallIcon:appIcon;wcscpy(tray.szTip,L"瞬贴 · 截图 / 贴图 / 录屏");Shell_NotifyIconW(NIM_ADD,&tray);
     refreshStatus();if(!wcsstr(args,L"--tray"))ShowWindow(mainWindow,SW_SHOW);UpdateWindow(mainWindow);MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)>0){
