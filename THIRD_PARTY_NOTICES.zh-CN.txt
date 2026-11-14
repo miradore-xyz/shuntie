@@ -1,0 +1,15 @@
+瞬贴 0.1.3
+
+界面图标：Lucide（ISC 许可）
+https://github.com/lucide-icons/lucide
+原始图标和许可证保存在项目 assets/lucide 中。
+
+FFmpeg 7.1.1 essentials（Gyan 构建，GPL 构建）
+下载：https://github.com/GyanD/codexffmpeg/releases/tag/7.1.1
+源码：https://github.com/FFmpeg/FFmpeg/tree/n7.1.1
+构建信息：运行 bin/ffmpeg.exe -version 或 -buildconf
+
+Gifski 1.34.0（AGPL 许可）
+https://github.com/ImageOptim/gifski/tree/1.34.0
+
+这些程序作为独立进程使用。外部编码器使整套软件的大小明显大于主程序。

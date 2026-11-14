@@ -1,0 +1,16 @@
+# 编译产物、编码器和本地测试数据
+/dist/
+/releases/
+/artifacts/
+/tools/*
+!/tools/generate_assets.py
+!/tools/fetch_dependencies.ps1
+/.zig-cache/
+/zig-out/
+/.serena/
+*.pdb
+*.obj
+*.res
+*.log
+settings.ini
+__pycache__/
