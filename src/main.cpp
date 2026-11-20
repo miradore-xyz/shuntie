@@ -414,7 +414,7 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:{PAINTSTRUCT paint;BeginPaint(hwnd,&paint);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(mainScale,mainScale));rt->Clear(rgb(BG));
         // 统一使用嵌入的高清 Logo，图标资源包含 16 到 256 像素尺寸。
         if(!logo)logo=bitmapFor(rt,brandImage,true);if(logo)rt->DrawBitmap(logo,D2D1::RectF(20,17,70,67),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.8",{83,50,240,69},10,MUTED);
+        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.9",{83,50,240,69},10,MUTED);
         text(rt,L"截图、标注、贴图。",{24,82,320,110},19,INK);
         text(rt,L"录下操作，一键复制 GIF 或视频。",{24,112,320,140},14,MUTED);
         auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,248,320,249},0x2C333C);text(rt,notice.empty()?s.message:notice,{24,256,320,284},12,ACCENT);}
