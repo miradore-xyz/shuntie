@@ -52,20 +52,20 @@ uint64_t fileSizeBytes(const std::wstring& path){
 }
 bool nonempty(const std::wstring& path){return fileSizeBytes(path)>0;}
 constexpr uint64_t kVideoMaxBytes=20000000ULL;
+constexpr uint64_t kVideoSkipCompressBytes=3000000ULL;
 struct VideoCompressPlan {
-    int outWidth=0,outHeight=0,outFps=30,targetKbps=1500,maxrateKbps=1725,bufsizeKbps=3450,gop=120;
+    int outWidth=0,outHeight=0,outFps=30,targetKbps=1500,maxrateKbps=1725,bufsizeKbps=3450,gop=120,crf=27;
 };
-VideoCompressPlan planVideoCompression(double durationSec,int srcW,int srcH,uint64_t maxBytes=kVideoMaxBytes,double fillRatio=0.90){
+VideoCompressPlan planVideoCompression(double durationSec,int srcW,int srcH,uint64_t maxBytes=kVideoMaxBytes,double fillRatio=0.88){
     durationSec=std::max(1.0,durationSec);
     double aimBytes=double(maxBytes)*std::clamp(fillRatio,0.35,0.95);
-    int targetKbps=std::clamp(int(std::floor(aimBytes*8.0/1000.0/durationSec)),100,12000);
-    int maxLongSide=480,outFps=10;
-    if(targetKbps>=5500){maxLongSide=1920;outFps=30;}
-    else if(targetKbps>=3200){maxLongSide=1600;outFps=30;}
-    else if(targetKbps>=1800){maxLongSide=1280;outFps=24;}
-    else if(targetKbps>=900){maxLongSide=960;outFps=20;}
-    else if(targetKbps>=450){maxLongSide=720;outFps=15;}
-    else if(targetKbps>=220){maxLongSide=640;outFps=12;}
+    int maxAvgKbps=std::clamp(int(std::floor(aimBytes*8.0/1000.0/durationSec)),120,10000);
+    int maxLongSide=640,outFps=10,crf=32;
+    if(maxAvgKbps>=3200){maxLongSide=2560;outFps=30;crf=(durationSec>=20.0?27:25);}
+    else if(maxAvgKbps>=1600){maxLongSide=2560;outFps=24;crf=28;}
+    else if(maxAvgKbps>=950){maxLongSide=1920;outFps=20;crf=29;}
+    else if(maxAvgKbps>=500){maxLongSide=1280;outFps=15;crf=30;}
+    else if(maxAvgKbps>=260){maxLongSide=960;outFps=12;crf=31;}
     int outW=0,outH=0;
     if(srcW>=2&&srcH>=2){
         int evenW=srcW&~1,evenH=srcH&~1;
@@ -78,10 +78,10 @@ VideoCompressPlan planVideoCompression(double durationSec,int srcW,int srcH,uint
             outW=evenW;outH=evenH;
         }
     }
-    int maxrateKbps=std::max(targetKbps+50,int(std::round(targetKbps*1.15)));
-    int bufsizeKbps=std::max(targetKbps*2,maxrateKbps*2);
+    int maxrateKbps=maxAvgKbps;
+    int bufsizeKbps=maxAvgKbps*2;
     int gop=std::max(outFps*2,outFps*4);
-    return {outW,outH,outFps,targetKbps,maxrateKbps,bufsizeKbps,gop};
+    return {outW,outH,outFps,maxAvgKbps,maxrateKbps,bufsizeKbps,gop,crf};
 }
 double probeVideoDurationSec(const std::wstring& ff,const std::wstring& inputMp4,double fallbackSec){
     std::wstring probeLog=inputMp4+L".probe.log";
@@ -106,29 +106,41 @@ double probeVideoDurationSec(const std::wstring& ff,const std::wstring& inputMp4
 bool compressVideoToLimit(const std::wstring& ff,const std::wstring& inputMp4,const std::wstring& outputMp4,const std::wstring& log,ULONGLONG durationMs,int srcW,int srcH,uint64_t maxBytes=kVideoMaxBytes){
     uint64_t rawBytes=fileSizeBytes(inputMp4);
     if(rawBytes==0)return false;
-    if(rawBytes<=maxBytes){
+    if(rawBytes<=std::min(maxBytes,kVideoSkipCompressBytes)){
         if(inputMp4!=outputMp4)return CopyFileW(inputMp4.c_str(),outputMp4.c_str(),FALSE)!=FALSE&&nonempty(outputMp4);
         return true;
     }
     double durationSec=probeVideoDurationSec(ff,inputMp4,double(durationMs)/1000.0);
-    auto runPass=[&](const VideoCompressPlan& plan,const std::wstring& dest,bool tightCap)->bool{
+    auto runPass=[&](const VideoCompressPlan& plan,const std::wstring& dest,bool crfVbvMode)->bool{
         std::wstring vf=L"fps="+std::to_wstring(plan.outFps);
         if(plan.outWidth>0&&plan.outHeight>0&&(plan.outWidth!=srcW||plan.outHeight!=srcH))
             vf+=L",scale="+std::to_wstring(plan.outWidth)+L":"+std::to_wstring(plan.outHeight)+L":flags=area";
-        int maxrate=tightCap?std::max(plan.targetKbps+20,int(std::round(plan.targetKbps*1.05))):plan.maxrateKbps;
-        int bufsize=tightCap?std::max(plan.targetKbps,maxrate):plan.bufsizeKbps;
+        int maxrate=crfVbvMode?plan.maxrateKbps:std::max(plan.targetKbps+20,int(std::round(plan.targetKbps*1.05)));
+        int bufsize=crfVbvMode?plan.bufsizeKbps:std::max(plan.targetKbps,maxrate);
         std::wstring commonTail=L" -pix_fmt yuv420p -profile:v high -an -movflags +faststart "+quote(dest);
         for(int attempt=0;attempt<2;++attempt){
             DeleteFileW(dest.c_str());
             std::wstring args=L"-hide_banner -nostdin -y -i "+quote(inputMp4)+L" -vf "+vf;
-            if(attempt==0){
-                args+=L" -c:v h264_nvenc -preset p5 -rc vbr -multipass qres -g "+std::to_wstring(plan.gop)+
-                    L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
-                    L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+            if(crfVbvMode){
+                if(attempt==0){
+                    args+=L" -c:v libx264 -preset veryfast -crf "+std::to_wstring(plan.crf)+
+                        L" -g "+std::to_wstring(plan.gop)+
+                        L" -maxrate "+std::to_wstring(maxrate)+L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+                }else{
+                    args+=L" -c:v h264_nvenc -preset p6 -tune hq -rc vbr -cq "+std::to_wstring(std::min(51,plan.crf+2))+
+                        L" -multipass qres -spatial_aq 1 -temporal_aq 1 -g "+std::to_wstring(plan.gop)+
+                        L" -b:v 0 -maxrate "+std::to_wstring(maxrate)+L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+                }
             }else{
-                args+=L" -c:v libx264 -preset veryfast -g "+std::to_wstring(plan.gop)+
-                    L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
-                    L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+                if(attempt==0){
+                    args+=L" -c:v libx264 -preset veryfast -g "+std::to_wstring(plan.gop)+
+                        L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
+                        L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+                }else{
+                    args+=L" -c:v h264_nvenc -preset p5 -rc vbr -multipass qres -g "+std::to_wstring(plan.gop)+
+                        L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
+                        L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+                }
             }
             Child child;
             if(launch(child,ff,args,log)&&result(child)==0&&nonempty(dest))return true;
@@ -136,16 +148,16 @@ bool compressVideoToLimit(const std::wstring& ff,const std::wstring& inputMp4,co
         DeleteFileW(dest.c_str());
         return false;
     };
-    auto plan1=planVideoCompression(durationSec,srcW,srcH,maxBytes,0.90);
+    auto plan1=planVideoCompression(durationSec,srcW,srcH,maxBytes,0.88);
     std::wstring tmp1=outputMp4+L".cmp1.mp4";
-    if(!runPass(plan1,tmp1,false)){DeleteFileW(tmp1.c_str());return false;}
+    if(!runPass(plan1,tmp1,true)){DeleteFileW(tmp1.c_str());return false;}
     uint64_t size1=fileSizeBytes(tmp1);
     std::wstring bestTmp=tmp1;uint64_t bestSize=size1;
-    if(size1>maxBytes&&plan1.targetKbps>100){
-        double retryFill=std::clamp(0.84*(double(maxBytes)/double(size1)),0.42,0.82);
+    if(size1>maxBytes&&plan1.targetKbps>120){
+        double retryFill=std::clamp(0.84*(double(maxBytes)/double(size1)),0.42,0.80);
         auto plan2=planVideoCompression(durationSec,srcW,srcH,maxBytes,retryFill);
         std::wstring tmp2=outputMp4+L".cmp2.mp4";
-        if(runPass(plan2,tmp2,true)){
+        if(runPass(plan2,tmp2,false)){
             uint64_t size2=fileSizeBytes(tmp2);
             if(size2>0&&size2<bestSize){
                 bestTmp=tmp2;bestSize=size2;DeleteFileW(tmp1.c_str());
@@ -155,6 +167,11 @@ bool compressVideoToLimit(const std::wstring& ff,const std::wstring& inputMp4,co
         }else{
             DeleteFileW(tmp2.c_str());
         }
+    }
+    if(rawBytes<=maxBytes&&bestSize>=rawBytes){
+        DeleteFileW(bestTmp.c_str());
+        if(inputMp4!=outputMp4)return CopyFileW(inputMp4.c_str(),outputMp4.c_str(),FALSE)!=FALSE&&nonempty(outputMp4);
+        return true;
     }
     if(!MoveFileExW(bestTmp.c_str(),outputMp4.c_str(),MOVEFILE_REPLACE_EXISTING)){
         DeleteFileW(bestTmp.c_str());return false;

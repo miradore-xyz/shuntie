@@ -319,7 +319,7 @@ struct PaletteMapper {
 
 // 邻近调色板缓存表：为有损 LZW 提供视觉最接近的候选替代色，显著拉长字典匹配链。
 struct NearPaletteTable {
-    static constexpr int MAX_NEAR = 6;
+    static constexpr int MAX_NEAR = 12;
     uint8_t nearIdx[256][MAX_NEAR]{};
     uint16_t nearDist[256][MAX_NEAR]{};
     uint8_t nearCount[256]{};
@@ -349,7 +349,7 @@ struct NearPaletteTable {
     }
 };
 
-// 高速 GIF89a LZW 压缩器（支持无损及可控有损字典匹配，输出 100% 标准兼容的 GIF89a 码流）。
+// 高速 GIF89a LZW 压缩器（支持无损及 Kornel 一维误差扩散有损字典匹配，绝不将透明与不透明像素互相替换）。
 struct LzwEncoder {
     static constexpr uint32_t HASH_SIZE = 16384;
     static constexpr uint32_t HASH_MASK = HASH_SIZE - 1;
@@ -361,9 +361,11 @@ struct LzwEncoder {
     LzwEncoder() : keys(HASH_SIZE, 0), vals(HASH_SIZE, 0), gens(HASH_SIZE, 0) {}
 
     std::vector<uint8_t> compress(
-        const uint8_t* pixels, size_t count, int minCodeSize,
-        int lossyLevel = 0, const NearPaletteTable* nearTable = nullptr
+        const uint8_t* pixels, const uint8_t* origRgb, int w, int h,
+        int minCodeSize, int transIdx, const std::vector<Rgb>& palette,
+        int lossyStrength = 0, const NearPaletteTable* nearTable = nullptr
     ) {
+        const size_t count = size_t(w) * size_t(h);
         std::vector<uint8_t> out;
         out.reserve(std::max<size_t>(64, count / 4));
         out.push_back(uint8_t(minCodeSize));
@@ -416,44 +418,87 @@ struct LzwEncoder {
             return out;
         }
 
-        const int maxRunErr = (lossyLevel == 1) ? 900 : (lossyLevel == 2) ? 2200 : (lossyLevel >= 3) ? 4800 : 0;
+        const bool lossy = (lossyStrength > 0 && origRgb != nullptr && nearTable != nullptr && !palette.empty());
+        const int maxDistSq = lossyStrength * lossyStrength * 3;
+        const int maxRunErr = maxDistSq * 3;
         int runErr = 0;
+        int errR = 0, errG = 0, errB = 0;
 
         uint32_t prefix = pixels[0];
-        for (size_t i = 1; i < count; ++i) {
-            uint8_t k = pixels[i];
-            uint32_t key = (prefix << 8) | k;
-            uint32_t slot = ((key * 2654435761u) >> 18) & HASH_MASK;
-            bool found = false;
-            while (gens[slot] == gen) {
-                if (keys[slot] == key) {
-                    prefix = vals[slot];
-                    found = true;
-                    break;
-                }
-                slot = (slot + 1u) & HASH_MASK;
-            }
-            if (!found && lossyLevel > 0 && nearTable && runErr < maxRunErr) {
-                uint8_t nc = nearTable->nearCount[k];
-                for (uint8_t j = 0; j < nc; ++j) {
-                    int d2 = int(nearTable->nearDist[k][j]);
-                    if (runErr + d2 > maxRunErr) break;
-                    uint8_t alt = nearTable->nearIdx[k][j];
-                    uint32_t aKey = (prefix << 8) | alt;
-                    uint32_t aSlot = ((aKey * 2654435761u) >> 18) & HASH_MASK;
-                    while (gens[aSlot] == gen) {
-                        if (keys[aSlot] == aKey) {
-                            prefix = vals[aSlot];
-                            runErr += d2;
-                            found = true;
-                            break;
-                        }
-                        aSlot = (aSlot + 1u) & HASH_MASK;
+        if (lossy && int(prefix) != transIdx && prefix < palette.size()) {
+            errR = std::clamp(int(origRgb[0]) - int(palette[prefix].r), -24, 24);
+            errG = std::clamp(int(origRgb[1]) - int(palette[prefix].g), -24, 24);
+            errB = std::clamp(int(origRgb[2]) - int(palette[prefix].b), -24, 24);
+        }
+
+        for (int y = 0; y < h; ++y) {
+            errR = errG = errB = 0;
+            const int xStart = (y == 0) ? 1 : 0;
+            for (int x = xStart; x < w; ++x) {
+                const size_t i = size_t(y) * size_t(w) + size_t(x);
+                const uint8_t k = pixels[i];
+                const uint32_t key = (prefix << 8) | k;
+                uint32_t slot = ((key * 2654435761u) >> 18) & HASH_MASK;
+                bool found = false;
+                while (gens[slot] == gen) {
+                    if (keys[slot] == key) {
+                        prefix = vals[slot];
+                        found = true;
+                        break;
                     }
-                    if (found) break;
+                    slot = (slot + 1u) & HASH_MASK;
                 }
-            }
-            if (!found) {
+                if (found) {
+                    if (!lossy || int(k) == transIdx || k >= palette.size()) {
+                        errR = errG = errB = 0;
+                    } else {
+                        int tR = std::clamp(int(origRgb[i * 3 + 0]) + (errR * 3) / 4, 0, 255);
+                        int tG = std::clamp(int(origRgb[i * 3 + 1]) + (errG * 3) / 4, 0, 255);
+                        int tB = std::clamp(int(origRgb[i * 3 + 2]) + (errB * 3) / 4, 0, 255);
+                        errR = std::clamp(tR - int(palette[k].r), -24, 24);
+                        errG = std::clamp(tG - int(palette[k].g), -24, 24);
+                        errB = std::clamp(tB - int(palette[k].b), -24, 24);
+                    }
+                    continue;
+                }
+
+                if (lossy && int(k) != transIdx && k < palette.size() && runErr < maxRunErr) {
+                    int tR = std::clamp(int(origRgb[i * 3 + 0]) + (errR * 3) / 4, 0, 255);
+                    int tG = std::clamp(int(origRgb[i * 3 + 1]) + (errG * 3) / 4, 0, 255);
+                    int tB = std::clamp(int(origRgb[i * 3 + 2]) + (errB * 3) / 4, 0, 255);
+                    int bestD2 = maxDistSq + 1;
+                    uint8_t bestAlt = 0;
+                    uint16_t bestVal = 0xFFFFu;
+                    const uint8_t nc = nearTable->nearCount[k];
+                    for (uint8_t j = 0; j < nc; ++j) {
+                        const uint8_t alt = nearTable->nearIdx[k][j];
+                        int dr = tR - int(palette[alt].r);
+                        int dg = tG - int(palette[alt].g);
+                        int db = tB - int(palette[alt].b);
+                        int d2 = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+                        if (d2 >= bestD2 || runErr + d2 > maxRunErr) continue;
+                        uint32_t aKey = (prefix << 8) | alt;
+                        uint32_t aSlot = ((aKey * 2654435761u) >> 18) & HASH_MASK;
+                        while (gens[aSlot] == gen) {
+                            if (keys[aSlot] == aKey) {
+                                bestD2 = d2;
+                                bestAlt = alt;
+                                bestVal = vals[aSlot];
+                                break;
+                            }
+                            aSlot = (aSlot + 1u) & HASH_MASK;
+                        }
+                    }
+                    if (bestVal != 0xFFFFu) {
+                        prefix = bestVal;
+                        runErr += bestD2;
+                        errR = std::clamp(tR - int(palette[bestAlt].r), -32, 32);
+                        errG = std::clamp(tG - int(palette[bestAlt].g), -32, 32);
+                        errB = std::clamp(tB - int(palette[bestAlt].b), -32, 32);
+                        continue;
+                    }
+                }
+
                 emitCode(prefix, codeSize);
                 runErr = 0;
                 if (nextCode < 4096u) {
@@ -467,6 +512,13 @@ struct LzwEncoder {
                 } else {
                     emitCode(clearCode, codeSize);
                     resetTable();
+                }
+                if (!lossy || int(k) == transIdx || k >= palette.size()) {
+                    errR = errG = errB = 0;
+                } else {
+                    errR = std::clamp(int(origRgb[i * 3 + 0]) - int(palette[k].r), -24, 24);
+                    errG = std::clamp(int(origRgb[i * 3 + 1]) - int(palette[k].g), -24, 24);
+                    errB = std::clamp(int(origRgb[i * 3 + 2]) - int(palette[k].b), -24, 24);
                 }
                 prefix = k;
             }
@@ -516,19 +568,24 @@ inline void writeGifHeader(std::ofstream& out, int w, int h, const std::vector<R
     out.write(reinterpret_cast<const char*>(netscape), sizeof(netscape));
 }
 
-inline void writeGifFrame(std::ofstream& out, int w, int h, unsigned totalDelayCs, const std::vector<uint8_t>& lzwData) {
+// 始终写单全局调色板 (LCTF=0) 且 Disposal=1 (不擦除)，局部差异透明复用大幅减体积且 100% 兼容 QQ。
+inline void writeGifFrame(
+    std::ofstream& out, int left, int top, int w, int h,
+    unsigned totalDelayCs, bool useTrans, uint8_t transIdx, const std::vector<uint8_t>& lzwData
+) {
     unsigned remaining = std::max(1u, totalDelayCs);
     while (remaining > 0) {
         unsigned d = std::min(remaining, 65535u);
         uint8_t gce[8] = {
             0x21, 0xF9, 0x04,
-            0x04, // Disposal = 1 (保留全画幅), TransparencyFlag = 0 (彻底杜绝 QQ 群聊拖影)
+            uint8_t(useTrans ? 0x05 : 0x04), // Disposal = 1 (Do Not Dispose), TransparencyFlag = useTrans ? 1 : 0
             uint8_t(d & 0xFFu), uint8_t((d >> 8) & 0xFFu),
-            0x00, 0x00
+            uint8_t(useTrans ? transIdx : 0x00), 0x00
         };
         uint8_t desc[10] = {
             0x2C,
-            0x00, 0x00, 0x00, 0x00,
+            uint8_t(left & 0xFF), uint8_t((left >> 8) & 0xFF),
+            uint8_t(top & 0xFF), uint8_t((top >> 8) & 0xFF),
             uint8_t(w & 0xFF), uint8_t((w >> 8) & 0xFF),
             uint8_t(h & 0xFF), uint8_t((h >> 8) & 0xFF),
             0x00 // LCTF = 0 (仅用全局调色板)
@@ -540,12 +597,26 @@ inline void writeGifFrame(std::ofstream& out, int w, int h, unsigned totalDelayC
     }
 }
 
-inline void mapFrameRowRange(
-    const uint8_t* currRgb, uint8_t* stabRgb, uint8_t* prevIdx, uint8_t* outIdx,
-    int outW, int y0, int y1, PaletteMapper& mapper, int snapDistSq, int stabTol, bool firstFrame
+struct RowBox {
+    int minX = INT32_MAX;
+    int maxX = -1;
+    bool hasOpaque = false;
+    bool hasTrans = false;
+};
+
+struct DeltaSubFrame {
+    int left = 0, top = 0, w = 0, h = 0;
+    bool useTrans = false;
+    std::vector<uint8_t> indices;
+    std::vector<uint8_t> rgb;
+};
+
+inline void mapOpaqueRows(
+    const uint8_t* currRgb, uint8_t* canvasRgb, uint8_t* canvasIdx, uint8_t* outIdx,
+    int outW, int y0, int y1, PaletteMapper& mapper, int snapDistSq
 ) {
     for (int y = y0; y < y1; ++y) {
-        size_t rowBase = size_t(y) * outW;
+        size_t rowBase = size_t(y) * size_t(outW);
         uint8_t rowPrevIdx = 0;
         bool hasRowPrev = false;
         for (int x = 0; x < outW; ++x) {
@@ -554,46 +625,151 @@ inline void mapFrameRowRange(
             uint8_t r = currRgb[o + 0];
             uint8_t g = currRgb[o + 1];
             uint8_t b = currRgb[o + 2];
-            if (!firstFrame && stabTol > 0) {
-                int dr = int(r) - int(stabRgb[o + 0]);
-                int dg = int(g) - int(stabRgb[o + 1]);
-                int db = int(b) - int(stabRgb[o + 2]);
-                if (dr >= -stabTol && dr <= stabTol &&
-                    dg >= -stabTol && dg <= stabTol &&
-                    db >= -stabTol && db <= stabTol) {
-                    uint8_t idx = prevIdx[p];
-                    outIdx[p] = idx;
-                    rowPrevIdx = idx;
-                    hasRowPrev = true;
-                    continue;
-                }
-            }
-            uint8_t best = mapper.mapPixel(r, g, b);
-            uint8_t chosen = best;
-            if (snapDistSq > 0 && hasRowPrev && rowPrevIdx != best) {
+            uint8_t chosen = mapper.mapPixel(r, g, b);
+            if (snapDistSq > 0 && hasRowPrev && rowPrevIdx != chosen) {
                 const Rgb& pr = mapper.palette[rowPrevIdx];
                 int drp = int(r) - int(pr.r), dgp = int(g) - int(pr.g), dbp = int(b) - int(pr.b);
                 int dPrev = 2 * drp * drp + 4 * dgp * dgp + 3 * dbp * dbp;
                 if (dPrev <= snapDistSq) {
-                    const Rgb& br = mapper.palette[best];
+                    const Rgb& br = mapper.palette[chosen];
                     int drb = int(r) - int(br.r), dgb = int(g) - int(br.g), dbb = int(b) - int(br.b);
                     int dBest = 2 * drb * drb + 4 * dgb * dgb + 3 * dbb * dbb;
-                    if (dPrev <= dBest + snapDistSq) {
-                        chosen = rowPrevIdx;
-                    }
+                    if (dPrev <= dBest + snapDistSq) chosen = rowPrevIdx;
                 }
             }
             outIdx[p] = chosen;
             rowPrevIdx = chosen;
             hasRowPrev = true;
-            if (stabTol > 0) {
-                prevIdx[p] = chosen;
-                stabRgb[o + 0] = r;
-                stabRgb[o + 1] = g;
-                stabRgb[o + 2] = b;
+            if (canvasIdx) canvasIdx[p] = chosen;
+            if (canvasRgb) {
+                const Rgb& qr = mapper.palette[chosen];
+                canvasRgb[o + 0] = qr.r;
+                canvasRgb[o + 1] = qr.g;
+                canvasRgb[o + 2] = qr.b;
             }
         }
     }
+}
+
+inline void mapDeltaRows(
+    const uint8_t* currRgb, uint8_t* canvasRgb, uint8_t* canvasIdx, uint8_t* fullOutIdx,
+    RowBox* rowBoxes, int outW, int y0, int y1, PaletteMapper& mapper,
+    int snapDistSq, int stabTol, bool hasTrans, uint8_t transIdx
+) {
+    const int stabTolSq6 = stabTol * stabTol * 6;
+    for (int y = y0; y < y1; ++y) {
+        size_t rowBase = size_t(y) * size_t(outW);
+        uint8_t rowPrevIdx = 0;
+        bool hasRowPrev = false;
+        RowBox rb;
+        for (int x = 0; x < outW; ++x) {
+            size_t p = rowBase + size_t(x);
+            size_t o = p * 3;
+            uint8_t r = currRgb[o + 0];
+            uint8_t g = currRgb[o + 1];
+            uint8_t b = currRgb[o + 2];
+
+            if (hasTrans && stabTol > 0) {
+                int dr = int(r) - int(canvasRgb[o + 0]);
+                int dg = int(g) - int(canvasRgb[o + 1]);
+                int db = int(b) - int(canvasRgb[o + 2]);
+                if (std::abs(dr) <= stabTol && std::abs(dg) <= stabTol && std::abs(db) <= stabTol &&
+                    (2 * dr * dr + 4 * dg * dg + 3 * db * db) <= stabTolSq6) {
+                    fullOutIdx[p] = transIdx;
+                    rb.hasTrans = true;
+                    hasRowPrev = false;
+                    continue;
+                }
+            }
+
+            uint8_t chosen = mapper.mapPixel(r, g, b);
+            if (hasTrans && chosen == canvasIdx[p]) {
+                fullOutIdx[p] = transIdx;
+                rb.hasTrans = true;
+                hasRowPrev = false;
+                continue;
+            }
+
+            if (snapDistSq > 0 && hasRowPrev && rowPrevIdx != chosen) {
+                const Rgb& pr = mapper.palette[rowPrevIdx];
+                int drp = int(r) - int(pr.r), dgp = int(g) - int(pr.g), dbp = int(b) - int(pr.b);
+                int dPrev = 2 * drp * drp + 4 * dgp * dgp + 3 * dbp * dbp;
+                if (dPrev <= snapDistSq) {
+                    const Rgb& br = mapper.palette[chosen];
+                    int drb = int(r) - int(br.r), dgb = int(g) - int(br.g), dbb = int(b) - int(br.b);
+                    int dBest = 2 * drb * drb + 4 * dgb * dgb + 3 * dbb * dbb;
+                    if (dPrev <= dBest + snapDistSq && (!hasTrans || rowPrevIdx != canvasIdx[p])) {
+                        chosen = rowPrevIdx;
+                    }
+                }
+            }
+
+            fullOutIdx[p] = chosen;
+            canvasIdx[p] = chosen;
+            const Rgb& qr = mapper.palette[chosen];
+            canvasRgb[o + 0] = qr.r;
+            canvasRgb[o + 1] = qr.g;
+            canvasRgb[o + 2] = qr.b;
+            rowPrevIdx = chosen;
+            hasRowPrev = true;
+            if (!rb.hasOpaque) {
+                rb.minX = x;
+                rb.maxX = x;
+                rb.hasOpaque = true;
+            } else {
+                rb.maxX = x;
+            }
+        }
+        rowBoxes[y] = rb;
+    }
+}
+
+inline DeltaSubFrame extractDirtySubFrame(
+    const uint8_t* fullIdx, const uint8_t* currRgb, const std::vector<RowBox>& rowBoxes,
+    int outW, int outH, bool hasTrans, uint8_t transIdx, bool keepRgb
+) {
+    DeltaSubFrame sub;
+    int minX = outW, maxX = -1, minY = outH, maxY = -1;
+    for (int y = 0; y < outH; ++y) {
+        if (!rowBoxes[y].hasOpaque) continue;
+        minX = std::min(minX, rowBoxes[y].minX);
+        maxX = std::max(maxX, rowBoxes[y].maxX);
+        minY = std::min(minY, y);
+        maxY = std::max(maxY, y);
+    }
+    if (maxX < minX || maxY < minY) {
+        return sub; // 整帧无变化，w=0, h=0 -> 合并延迟
+    }
+    sub.left = minX;
+    sub.top = minY;
+    sub.w = maxX - minX + 1;
+    sub.h = maxY - minY + 1;
+    const size_t subPixels = size_t(sub.w) * size_t(sub.h);
+    sub.indices.resize(subPixels);
+    if (keepRgb) sub.rgb.resize(subPixels * 3);
+
+    bool anyTrans = false;
+    for (int r = 0; r < sub.h; ++r) {
+        int sy = sub.top + r;
+        const uint8_t* srcRow = fullIdx + size_t(sy) * size_t(outW) + size_t(sub.left);
+        uint8_t* dstRow = sub.indices.data() + size_t(r) * size_t(sub.w);
+        std::memcpy(dstRow, srcRow, size_t(sub.w));
+        if (hasTrans && !anyTrans && rowBoxes[sy].hasTrans) {
+            for (int c = 0; c < sub.w; ++c) {
+                if (dstRow[c] == transIdx) {
+                    anyTrans = true;
+                    break;
+                }
+            }
+        }
+        if (keepRgb) {
+            const uint8_t* srcRgbRow = currRgb + (size_t(sy) * size_t(outW) + size_t(sub.left)) * 3;
+            uint8_t* dstRgbRow = sub.rgb.data() + size_t(r) * size_t(sub.w) * 3;
+            std::memcpy(dstRgbRow, srcRgbRow, size_t(sub.w) * 3);
+        }
+    }
+    sub.useTrans = hasTrans && anyTrans;
+    return sub;
 }
 
 struct GifParams {
@@ -602,7 +778,7 @@ struct GifParams {
     int maxColors;
     int dedupeTol;
     int stabTol;
-    int lossyLevel;
+    int lossyStrength;
     uint64_t targetMaxBytes;
     int qualityMode;
 };
@@ -654,7 +830,9 @@ inline AttemptOutcome encodeNativeGifAttempt(
 
     std::vector<BYTE> current(rgbaBytes), previous(rgbaBytes);
     std::vector<std::vector<uint8_t>> cachedRgb;
-    std::vector<std::vector<uint8_t>> probeFallbackRgb; // 流式超限时的 6 帧探针缓存
+    std::vector<uint8_t> probeFrame0Rgb;
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> probePairs;
+    std::vector<uint8_t> streamLastKeptRgb;
     size_t cachedBytes = 0;
     bool streamingPass2 = false;
 
@@ -712,20 +890,31 @@ inline AttemptOutcome encodeNativeGifAttempt(
             cachedRgb.push_back(std::move(rgb));
             cachedBytes += rgbBytes;
         } else {
+            std::vector<uint8_t> rgb(rgbBytes);
+            packRgbaToRgb24(rgba, rgb.data(), pixelCount);
             if (!streamingPass2) {
                 streamingPass2 = true;
-                for (size_t i = 0; i < 6 && i < cachedRgb.size(); ++i) {
-                    size_t pick = (i * cachedRgb.size()) / std::min<size_t>(6, cachedRgb.size());
-                    probeFallbackRgb.push_back(std::move(cachedRgb[pick]));
+                if (!cachedRgb.empty()) {
+                    probeFrame0Rgb = cachedRgb[0];
+                    size_t n = cachedRgb.size();
+                    if (n >= 2) {
+                        size_t want = std::min<size_t>(4, n - 1);
+                        for (size_t i = 0; i < want; ++i) {
+                            size_t pick = 1 + (i * (n - 1)) / want;
+                            probePairs.emplace_back(cachedRgb[pick - 1], cachedRgb[pick]);
+                        }
+                    }
+                    streamLastKeptRgb = cachedRgb.back();
                 }
                 std::vector<std::vector<uint8_t>>().swap(cachedRgb);
                 cachedBytes = 0;
             }
-            if (probeFallbackRgb.size() < 6) {
-                std::vector<uint8_t> rgb(rgbBytes);
-                packRgbaToRgb24(rgba, rgb.data(), pixelCount);
-                probeFallbackRgb.push_back(std::move(rgb));
+            if (probePairs.size() < 5 && !streamLastKeptRgb.empty()) {
+                if (kept.size() % 12 == 0) {
+                    probePairs.emplace_back(streamLastKeptRgb, rgb);
+                }
             }
+            streamLastKeptRgb = std::move(rgb);
         }
     };
 
@@ -768,6 +957,7 @@ inline AttemptOutcome encodeNativeGifAttempt(
     unsigned lastEndIdx = std::max(readFrames, decoder.endIndex(fps));
     unsigned lastDur = unsigned((uint64_t(lastEndIdx) * 100 + fps / 2) / fps - (uint64_t(pending) * 100 + fps / 2) / fps);
     kept.push_back({pending, lastEndIdx, std::max(1u, lastDur)});
+    std::vector<uint8_t>().swap(streamLastKeptRgb);
 
     res.readFrames = readFrames;
     res.framesWritten = kept.size();
@@ -814,46 +1004,82 @@ inline AttemptOutcome encodeNativeGifAttempt(
         }
     }
 
+    const bool hasTrans = palette.size() <= 255;
+    const uint8_t transIdx = hasTrans ? uint8_t(palette.size()) : 0;
+    const size_t totalPaletteEntries = palette.size() + (hasTrans ? 1u : 0u);
     int gctBits = 2;
-    while ((1 << gctBits) < int(palette.size()) && gctBits < 8) ++gctBits;
+    while ((1 << gctBits) < int(totalPaletteEntries) && gctBits < 8) ++gctBits;
     const int minCodeSize = gctBits;
     res.colors = palette.size();
 
     PaletteMapper mapper;
     mapper.init(palette, exactPalette);
 
-    const int snapDistSq = (cfg.lossyLevel == 1) ? 120 : (cfg.lossyLevel == 2) ? 260 : (cfg.lossyLevel >= 3) ? 480 : 0;
-    const int maxSubDistSq = (cfg.lossyLevel == 1) ? 450 : (cfg.lossyLevel == 2) ? 1100 : (cfg.lossyLevel >= 3) ? 2400 : 0;
+    const int snapDistSq = (cfg.lossyStrength > 0) ? std::clamp(cfg.lossyStrength * 3, 60, 420) : 0;
+    const int maxSubDistSq = (cfg.lossyStrength > 0) ? (cfg.lossyStrength * cfg.lossyStrength * 3) : 0;
     NearPaletteTable nearTable;
-    if (cfg.lossyLevel > 0 && !exactPalette) {
+    if (cfg.lossyStrength > 0 && !exactPalette) {
         nearTable.build(mapper.palette, maxSubDistSq);
     }
     res.quantMs = GetTickCount64() - qStart;
 
     const size_t totalFrames = kept.size();
 
-    // 6 帧快速体积探针：在完整编码前预估总体积，超限则提前重采样而无需浪费编码时间。
-    if (allowProbeAbort && cfg.targetMaxBytes > 0 && totalFrames > 6) {
-        std::vector<const uint8_t*> probePtrs;
-        if (!streamingPass2 && !cachedRgb.empty()) {
-            size_t cnt = std::min<size_t>(6, cachedRgb.size());
+    // 基于增量差分透明块与有损 LZW 的快速体积探针（在完整编码前预估大小）
+    if (allowProbeAbort && cfg.targetMaxBytes > 0 && totalFrames > 4) {
+        const uint8_t* f0Ptr = !streamingPass2 && !cachedRgb.empty() ? cachedRgb[0].data()
+                              : (!probeFrame0Rgb.empty() ? probeFrame0Rgb.data() : nullptr);
+        std::vector<std::pair<const uint8_t*, const uint8_t*>> pairPtrs;
+        if (!streamingPass2 && cachedRgb.size() >= 2) {
+            size_t cnt = std::min<size_t>(5, cachedRgb.size() - 1);
             for (size_t i = 0; i < cnt; ++i) {
-                size_t pick = (i * (cachedRgb.size() - 1)) / std::max<size_t>(1, cnt - 1);
-                probePtrs.push_back(cachedRgb[pick].data());
+                size_t pick = 1 + (i * (cachedRgb.size() - 2)) / std::max<size_t>(1, cnt - 1);
+                pick = std::clamp<size_t>(pick, 1, cachedRgb.size() - 1);
+                pairPtrs.emplace_back(cachedRgb[pick - 1].data(), cachedRgb[pick].data());
             }
-        } else if (!probeFallbackRgb.empty()) {
-            for (const auto& fr : probeFallbackRgb) probePtrs.push_back(fr.data());
+        } else {
+            for (const auto& pr : probePairs) {
+                pairPtrs.emplace_back(pr.first.data(), pr.second.data());
+            }
         }
-        if (!probePtrs.empty()) {
-            uint64_t probeBytesSum = 0;
-            std::vector<uint8_t> tmpIdx(pixelCount);
+        if (f0Ptr && !pairPtrs.empty()) {
             LzwEncoder probeLzw;
-            for (const uint8_t* rgbPtr : probePtrs) {
-                mapFrameRowRange(rgbPtr, nullptr, nullptr, tmpIdx.data(), outW, 0, outH, mapper, snapDistSq, 0, true);
-                auto lzwOut = probeLzw.compress(tmpIdx.data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
-                probeBytesSum += uint64_t(18 + lzwOut.size());
+            std::vector<uint8_t> tmpIdx(pixelCount);
+            mapOpaqueRows(f0Ptr, nullptr, nullptr, tmpIdx.data(), outW, 0, outH, mapper, snapDistSq);
+            auto lzw0 = probeLzw.compress(
+                tmpIdx.data(), cfg.lossyStrength > 0 ? f0Ptr : nullptr,
+                outW, outH, minCodeSize, hasTrans ? int(transIdx) : -1,
+                mapper.palette, cfg.lossyStrength, &nearTable
+            );
+            uint64_t size0 = uint64_t(18 + lzw0.size());
+
+            uint64_t deltaSum = 0;
+            std::vector<uint8_t> pairCanvasRgb(rgbBytes);
+            std::vector<uint8_t> pairCanvasIdx(pixelCount);
+            std::vector<RowBox> pairRows(outH);
+            for (const auto& pr : pairPtrs) {
+                mapOpaqueRows(pr.first, pairCanvasRgb.data(), pairCanvasIdx.data(), tmpIdx.data(), outW, 0, outH, mapper, snapDistSq);
+                mapDeltaRows(
+                    pr.second, pairCanvasRgb.data(), pairCanvasIdx.data(), tmpIdx.data(),
+                    pairRows.data(), outW, 0, outH, mapper, snapDistSq, cfg.stabTol, hasTrans, transIdx
+                );
+                auto dSub = extractDirtySubFrame(
+                    tmpIdx.data(), pr.second, pairRows, outW, outH,
+                    hasTrans, transIdx, cfg.lossyStrength > 0
+                );
+                if (dSub.w > 0 && dSub.h > 0) {
+                    auto lzwD = probeLzw.compress(
+                        dSub.indices.data(), cfg.lossyStrength > 0 ? dSub.rgb.data() : nullptr,
+                        dSub.w, dSub.h, minCodeSize, dSub.useTrans ? int(transIdx) : -1,
+                        mapper.palette, cfg.lossyStrength, &nearTable
+                    );
+                    deltaSum += uint64_t(18 + lzwD.size());
+                } else {
+                    deltaSum += 18;
+                }
             }
-            uint64_t est = uint64_t((double(probeBytesSum) / double(probePtrs.size())) * double(totalFrames)) + 2048;
+            uint64_t avgDelta = deltaSum / pairPtrs.size();
+            uint64_t est = size0 + avgDelta * uint64_t(totalFrames - 1) + 2048;
             res.estBytes = est;
             if (est > cfg.targetMaxBytes) {
                 res.needsRetry = true;
@@ -861,7 +1087,8 @@ inline AttemptOutcome encodeNativeGifAttempt(
             }
         }
     }
-    std::vector<std::vector<uint8_t>>().swap(probeFallbackRgb);
+    std::vector<uint8_t>().swap(probeFrame0Rgb);
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>().swap(probePairs);
 
     ULONGLONG eStart = GetTickCount64();
     std::ofstream gifOut(gif.c_str(), std::ios::binary);
@@ -869,107 +1096,153 @@ inline AttemptOutcome encodeNativeGifAttempt(
     writeGifHeader(gifOut, outW, outH, palette, gctBits);
 
     const unsigned numThreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+    const unsigned sliceThreads = std::min<unsigned>(numThreads, std::max<unsigned>(1, unsigned(outH / 16)));
+    std::vector<std::pair<int, int>> bands;
+    for (unsigned t = 0; t < sliceThreads; ++t) {
+        int y0 = (t == 0) ? 0 : ((outH * int(t)) / int(sliceThreads));
+        int y1 = (t + 1 == sliceThreads) ? outH : ((outH * int(t + 1)) / int(sliceThreads));
+        if (y1 > y0) bands.emplace_back(y0, y1);
+    }
 
-    if (!streamingPass2 && cachedRgb.size() == totalFrames) {
-        std::vector<std::vector<uint8_t>> indexedFrames(totalFrames, std::vector<uint8_t>(pixelCount));
-        if (cfg.stabTol > 0) {
-            unsigned sliceThreads = std::min<unsigned>(numThreads, std::max<unsigned>(1, unsigned(outH / 16)));
-            std::vector<std::thread> workers;
-            for (unsigned t = 0; t < sliceThreads; ++t) {
-                int y0 = (t == 0) ? 0 : (((outH * int(t)) / int(sliceThreads)) & ~3);
-                int y1 = (t + 1 == sliceThreads) ? outH : (((outH * int(t + 1)) / int(sliceThreads)) & ~3);
-                if (y1 <= y0) continue;
-                workers.emplace_back([&, y0, y1]() {
-                    std::vector<uint8_t> sliceStab(size_t(y1 - y0) * outW * 3, 0);
-                    std::vector<uint8_t> slicePrevIdx(size_t(y1 - y0) * outW, 0);
-                    size_t sliceOffsetBytes = size_t(y0) * outW * 3;
-                    size_t sliceOffsetPx = size_t(y0) * outW;
-                    for (size_t f = 0; f < totalFrames; ++f) {
-                        mapFrameRowRange(
-                            cachedRgb[f].data() + sliceOffsetBytes,
-                            sliceStab.data(), slicePrevIdx.data(),
-                            indexedFrames[f].data() + sliceOffsetPx,
-                            outW, 0, y1 - y0, mapper, snapDistSq, cfg.stabTol, f == 0
-                        );
-                    }
-                });
-            }
-            for (auto& w : workers) w.join();
-        } else {
-            std::atomic<size_t> nextFrame{0};
-            unsigned mapThreads = std::min<unsigned>(numThreads, unsigned(totalFrames));
-            std::vector<std::thread> workers;
-            for (unsigned t = 0; t < mapThreads; ++t) {
-                workers.emplace_back([&]() {
-                    for (;;) {
-                        size_t f = nextFrame.fetch_add(1, std::memory_order_relaxed);
-                        if (f >= totalFrames) break;
-                        mapFrameRowRange(
-                            cachedRgb[f].data(), nullptr, nullptr, indexedFrames[f].data(),
-                            outW, 0, outH, mapper, snapDistSq, 0, true
-                        );
-                    }
-                });
-            }
-            for (auto& w : workers) w.join();
+    struct PendingOut {
+        int left = 0, top = 0, w = 0, h = 0;
+        bool useTrans = false;
+        unsigned delayCs = 0;
+        std::vector<uint8_t> lzw;
+    };
+    bool hasPendingOut = false;
+    PendingOut pendingOut{};
+    size_t emittedCount = 0;
+
+    auto emitOrFold = [&](int left, int top, int w, int h, bool useTrans, unsigned delayCs, std::vector<uint8_t>&& lzw) {
+        if (w <= 0 || h <= 0) {
+            if (hasPendingOut) pendingOut.delayCs += delayCs;
+            return;
         }
-        std::vector<std::vector<uint8_t>>().swap(cachedRgb);
+        if (hasPendingOut) {
+            writeGifFrame(gifOut, pendingOut.left, pendingOut.top, pendingOut.w, pendingOut.h,
+                          pendingOut.delayCs, pendingOut.useTrans, transIdx, pendingOut.lzw);
+            ++emittedCount;
+        }
+        pendingOut = {left, top, w, h, useTrans, delayCs, std::move(lzw)};
+        hasPendingOut = true;
+    };
 
-        std::vector<std::vector<uint8_t>> lzwFrames(totalFrames);
-        std::atomic<size_t> nextLzw{0};
-        unsigned lzwThreads = std::min<unsigned>(numThreads, unsigned(totalFrames));
-        std::vector<std::thread> lzwWorkers;
-        for (unsigned t = 0; t < lzwThreads; ++t) {
-            lzwWorkers.emplace_back([&]() {
+    std::vector<uint8_t> canvasRgb(rgbBytes);
+    std::vector<uint8_t> canvasIdx(pixelCount);
+    std::vector<uint8_t> fullOutIdx(pixelCount);
+    std::vector<RowBox> rowBoxes(outH);
+
+    auto encodeAndWriteBatch = [&](std::vector<DeltaSubFrame>& batch, std::vector<unsigned>& batchDelays) {
+        if (batch.empty()) return;
+        std::vector<std::vector<uint8_t>> batchLzw(batch.size());
+        std::atomic<size_t> nextItem{0};
+        unsigned bt = std::min<unsigned>(numThreads, unsigned(batch.size()));
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < bt; ++t) {
+            workers.emplace_back([&]() {
                 LzwEncoder lzw;
                 for (;;) {
-                    size_t f = nextLzw.fetch_add(1, std::memory_order_relaxed);
-                    if (f >= totalFrames) break;
-                    lzwFrames[f] = lzw.compress(indexedFrames[f].data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
+                    size_t idx = nextItem.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= batch.size()) break;
+                    auto& sf = batch[idx];
+                    if (sf.w > 0 && sf.h > 0) {
+                        batchLzw[idx] = lzw.compress(
+                            sf.indices.data(),
+                            cfg.lossyStrength > 0 && !sf.rgb.empty() ? sf.rgb.data() : nullptr,
+                            sf.w, sf.h, minCodeSize, sf.useTrans ? int(transIdx) : -1,
+                            mapper.palette, cfg.lossyStrength, &nearTable
+                        );
+                    }
                 }
             });
         }
-        for (auto& w : lzwWorkers) w.join();
-
-        for (size_t f = 0; f < totalFrames; ++f) {
-            writeGifFrame(gifOut, outW, outH, kept[f].delayCs, lzwFrames[f]);
+        for (auto& w : workers) w.join();
+        for (size_t i = 0; i < batch.size(); ++i) {
+            emitOrFold(batch[i].left, batch[i].top, batch[i].w, batch[i].h,
+                       batch[i].useTrans, batchDelays[i], std::move(batchLzw[i]));
         }
-    } else {
-        NativeVideo decoder2(video);
-        if (decoder2.error < 0) return res;
-        std::vector<uint8_t> stabRgb(cfg.stabTol > 0 ? rgbBytes : 0, 0);
-        std::vector<uint8_t> prevIdx(cfg.stabTol > 0 ? pixelCount : 0, 0);
+        batch.clear();
+        batchDelays.clear();
+    };
 
-        size_t batchCap = std::max<size_t>(1, std::min<size_t>(numThreads * 2, (128ull * 1024 * 1024) / std::max<size_t>(1, pixelCount + rgbBytes)));
-        std::vector<std::vector<uint8_t>> batchIndexed;
-        std::vector<unsigned> batchDelays;
-        batchIndexed.reserve(batchCap);
-        batchDelays.reserve(batchCap);
-
-        auto flushBatch = [&]() {
-            if (batchIndexed.empty()) return;
-            std::vector<std::vector<uint8_t>> batchLzw(batchIndexed.size());
-            std::atomic<size_t> nextItem{0};
-            unsigned bt = std::min<unsigned>(numThreads, unsigned(batchIndexed.size()));
+    auto processFrameToSub = [&](size_t frameNo, const uint8_t* currRgbPtr) -> DeltaSubFrame {
+        if (frameNo == 0) {
+            if (bands.size() <= 1) {
+                mapOpaqueRows(currRgbPtr, canvasRgb.data(), canvasIdx.data(), fullOutIdx.data(), outW, 0, outH, mapper, snapDistSq);
+            } else {
+                std::vector<std::thread> workers;
+                for (auto b : bands) {
+                    workers.emplace_back([&, b]() {
+                        mapOpaqueRows(currRgbPtr, canvasRgb.data(), canvasIdx.data(), fullOutIdx.data(),
+                                      outW, b.first, b.second, mapper, snapDistSq);
+                    });
+                }
+                for (auto& w : workers) w.join();
+            }
+            DeltaSubFrame f0;
+            f0.left = 0; f0.top = 0; f0.w = outW; f0.h = outH;
+            f0.useTrans = false;
+            f0.indices = fullOutIdx;
+            if (cfg.lossyStrength > 0) {
+                f0.rgb.assign(currRgbPtr, currRgbPtr + rgbBytes);
+            }
+            return f0;
+        }
+        if (bands.size() <= 1) {
+            mapDeltaRows(currRgbPtr, canvasRgb.data(), canvasIdx.data(), fullOutIdx.data(),
+                         rowBoxes.data(), outW, 0, outH, mapper, snapDistSq, cfg.stabTol, hasTrans, transIdx);
+        } else {
             std::vector<std::thread> workers;
-            for (unsigned t = 0; t < bt; ++t) {
-                workers.emplace_back([&]() {
-                    LzwEncoder lzw;
-                    for (;;) {
-                        size_t idx = nextItem.fetch_add(1, std::memory_order_relaxed);
-                        if (idx >= batchIndexed.size()) break;
-                        batchLzw[idx] = lzw.compress(batchIndexed[idx].data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
-                    }
+            for (auto b : bands) {
+                workers.emplace_back([&, b]() {
+                    mapDeltaRows(currRgbPtr, canvasRgb.data(), canvasIdx.data(), fullOutIdx.data(),
+                                 rowBoxes.data(), outW, b.first, b.second, mapper, snapDistSq, cfg.stabTol, hasTrans, transIdx);
                 });
             }
             for (auto& w : workers) w.join();
-            for (size_t i = 0; i < batchLzw.size(); ++i) {
-                writeGifFrame(gifOut, outW, outH, batchDelays[i], batchLzw[i]);
-            }
-            batchIndexed.clear();
-            batchDelays.clear();
-        };
+        }
+        return extractDirtySubFrame(fullOutIdx.data(), currRgbPtr, rowBoxes, outW, outH,
+                                    hasTrans, transIdx, cfg.lossyStrength > 0);
+    };
 
+    std::vector<DeltaSubFrame> batch;
+    std::vector<unsigned> batchDelays;
+    size_t batchBytes = 0;
+    constexpr size_t MAX_BATCH_BYTES = 64ull * 1024 * 1024;
+    const size_t batchMaxCount = std::max<size_t>(4, size_t(numThreads) * 2);
+
+    auto pushDeltaToBatch = [&](DeltaSubFrame&& sub, unsigned delayCs) {
+        if (sub.w <= 0 || sub.h <= 0) {
+            if (!batchDelays.empty()) {
+                batchDelays.back() += delayCs;
+            } else {
+                encodeAndWriteBatch(batch, batchDelays);
+                std::vector<uint8_t> emptyLzw;
+                emitOrFold(0, 0, 0, 0, false, delayCs, std::move(emptyLzw));
+            }
+            return;
+        }
+        batchBytes += sub.indices.size() + sub.rgb.size();
+        batch.push_back(std::move(sub));
+        batchDelays.push_back(delayCs);
+        if (batch.size() >= batchMaxCount || batchBytes >= MAX_BATCH_BYTES) {
+            encodeAndWriteBatch(batch, batchDelays);
+            batchBytes = 0;
+        }
+    };
+
+    if (!streamingPass2 && cachedRgb.size() == totalFrames) {
+        for (size_t f = 0; f < totalFrames; ++f) {
+            DeltaSubFrame sub = processFrameToSub(f, cachedRgb[f].data());
+            std::vector<uint8_t>().swap(cachedRgb[f]);
+            pushDeltaToBatch(std::move(sub), kept[f].delayCs);
+        }
+        std::vector<std::vector<uint8_t>>().swap(cachedRgb);
+        encodeAndWriteBatch(batch, batchDelays);
+    } else {
+        NativeVideo decoder2(video);
+        if (decoder2.error < 0) return res;
         std::vector<uint8_t> tmpRgb(rgbBytes);
         size_t targetIdx = 0;
         unsigned read2 = 0;
@@ -980,21 +1253,18 @@ inline AttemptOutcome encodeNativeGifAttempt(
             if (idx < kept[targetIdx].startSample) continue;
             if (!decoder2.rgb(current, outW, outH)) return res;
             packRgbaToRgb24(current.data(), tmpRgb.data(), pixelCount);
-            std::vector<uint8_t> mapped(pixelCount);
-            mapFrameRowRange(
-                tmpRgb.data(),
-                cfg.stabTol > 0 ? stabRgb.data() : nullptr,
-                cfg.stabTol > 0 ? prevIdx.data() : nullptr,
-                mapped.data(),
-                outW, 0, outH, mapper, snapDistSq, cfg.stabTol, targetIdx == 0
-            );
-            batchIndexed.push_back(std::move(mapped));
-            batchDelays.push_back(kept[targetIdx].delayCs);
+            DeltaSubFrame sub = processFrameToSub(targetIdx, tmpRgb.data());
+            pushDeltaToBatch(std::move(sub), kept[targetIdx].delayCs);
             ++targetIdx;
-            if (batchIndexed.size() >= batchCap) flushBatch();
         }
-        flushBatch();
+        encodeAndWriteBatch(batch, batchDelays);
         if (targetIdx != totalFrames) return res;
+    }
+
+    if (hasPendingOut) {
+        writeGifFrame(gifOut, pendingOut.left, pendingOut.top, pendingOut.w, pendingOut.h,
+                      pendingOut.delayCs, pendingOut.useTrans, transIdx, pendingOut.lzw);
+        ++emittedCount;
     }
 
     uint8_t trailer = 0x3B;
@@ -1004,7 +1274,7 @@ inline AttemptOutcome encodeNativeGifAttempt(
     res.fileBytes = uint64_t(gifOut.tellp());
     gifOut.close();
     res.encodeMs = GetTickCount64() - eStart;
-    res.ok = writeOk && totalFrames > 0;
+    res.ok = writeOk && totalFrames > 0 && emittedCount > 0;
     if (res.ok && allowProbeAbort && cfg.targetMaxBytes > 0 && res.fileBytes > uint64_t(double(cfg.targetMaxBytes) * 1.12)) {
         res.needsRetry = true;
     }
@@ -1012,42 +1282,43 @@ inline AttemptOutcome encodeNativeGifAttempt(
 }
 
 inline void adaptParamsForBudget(GifParams& cfg, int curW, int curH, size_t curFrames, uint64_t observedBytes) {
-    double ratio = (double(cfg.targetMaxBytes) * 0.78) / double(std::max<uint64_t>(1, observedBytes));
+    double ratio = (double(cfg.targetMaxBytes) * 0.80) / double(std::max<uint64_t>(1, observedBytes));
     int oldMaxDim = std::max(curW, curH);
     int oldFps = cfg.effFps;
-    int oldLossy = cfg.lossyLevel;
-    int oldColors = cfg.maxColors;
 
-    cfg.lossyLevel = std::min(3, cfg.lossyLevel + 1);
-    double lossyGain = (cfg.lossyLevel > oldLossy) ? 1.28 : 1.0;
+    // 优先保证原生 2K 分辨率清晰度：先增强 Kornel 有损 LZW、颜色量化挡位、帧间静默容差与帧率，仅在极端超标时最后缩尺寸。
+    cfg.lossyStrength = std::min(145, cfg.lossyStrength + 35);
+    cfg.stabTol = std::min(16, cfg.stabTol + 4);
+    cfg.dedupeTol = std::min(12, cfg.dedupeTol + 2);
 
-    if (cfg.maxColors > 64) cfg.maxColors = 64;
-    else if (ratio < 0.55 && cfg.maxColors > 48) cfg.maxColors = 48;
-    double colorGain = (cfg.maxColors < oldColors) ? 1.10 : 1.0;
+    if (cfg.maxColors > 127) cfg.maxColors = 127;
+    else if (cfg.maxColors > 63) cfg.maxColors = 63;
+    else if (ratio < 0.60 && cfg.maxColors > 31) cfg.maxColors = 31;
 
-    double fpsGain = 1.0;
-    if (curFrames > 32 && ratio < 0.72) {
-        double fpsFactor = std::clamp(std::pow(ratio, 0.28), 0.55, 0.85);
-        int newFps = std::max(8, int(std::floor(double(oldFps) * fpsFactor)));
-        if (newFps < oldFps) {
-            cfg.effFps = newFps;
-            fpsGain = double(oldFps) / double(newFps);
-        }
+    if (curFrames > 24 && ratio < 0.85) {
+        if (cfg.effFps > 15) cfg.effFps = 15;
+        else if (cfg.effFps > 12) cfg.effFps = 12;
+        else if (cfg.effFps > 10) cfg.effFps = 10;
+        else if (cfg.effFps > 8 && ratio < 0.60) cfg.effFps = 8;
     }
 
-    double areaRatio = ratio * lossyGain * colorGain * fpsGain;
-    double dimScale = std::clamp(std::sqrt(areaRatio), 0.28, 0.90);
-    int newMaxW = std::max(360, int(std::lround(double(oldMaxDim) * dimScale)) & ~1);
-    if (newMaxW >= oldMaxDim && cfg.effFps >= oldFps && cfg.lossyLevel <= oldLossy) {
-        newMaxW = std::max(360, int(std::lround(double(oldMaxDim) * 0.78)) & ~1);
+    bool atFloor = (cfg.lossyStrength >= 115 && cfg.maxColors <= 63 && cfg.effFps <= 10);
+    bool extremeOverflow = (double(observedBytes) > double(cfg.targetMaxBytes) * 4.0);
+    if (atFloor || extremeOverflow) {
+        double dimScale = std::clamp(std::sqrt(ratio * 1.4), 0.50, 0.85);
+        int baseDim = cfg.effMaxWidth > 0 ? std::min(cfg.effMaxWidth, oldMaxDim) : oldMaxDim;
+        int newMaxW = std::max(640, int(std::lround(double(baseDim) * dimScale)) & ~1);
+        if (newMaxW >= baseDim) newMaxW = std::max(640, int(std::lround(double(baseDim) * 0.80)) & ~1);
+        cfg.effMaxWidth = newMaxW;
+    } else if (cfg.effFps == oldFps && cfg.lossyStrength >= 145) {
+        cfg.effMaxWidth = std::max(640, int(std::lround(double(oldMaxDim) * 0.85)) & ~1);
     }
-    cfg.effMaxWidth = newMaxW;
 }
 
 } // namespace native_gif_detail
 
 // qualityMode:
-//   0 = 小体积 (≤6MB), 1 = 均衡 (≤12MB), 2 = 高清 (≤25MB), 3 = 原尺寸精确回归模式（不设上限、不降采样、无损容差）
+//   0 = 2K 小体积 (≤8MB), 1 = 2K 均衡 (≤15MB), 2 = 2K 原画 (≤25MB), 3 = 原尺寸精确回归模式（无损容差）
 inline bool encodeNativeGif(
     const std::wstring& tool, const std::wstring& video, const std::wstring& gif, const std::wstring& log,
     int fps, int width, int height, int maxWidth = 0, int qualityMode = 3
@@ -1055,17 +1326,11 @@ inline bool encodeNativeGif(
     using namespace native_gif_detail;
     ULONGLONG began = GetTickCount64();
 
-    double estDurationSec = 0.0;
-    {
+    if (width <= 0 || height <= 0) {
         NativeVideo probe(video);
         if (probe.error < 0) return false;
-        if (width <= 0 || height <= 0) {
-            width = probe.sourceWidth();
-            height = probe.sourceHeight();
-        }
-        if (probe.container && probe.container->duration > 0) {
-            estDurationSec = double(probe.container->duration) / double(AV_TIME_BASE);
-        }
+        width = probe.sourceWidth();
+        height = probe.sourceHeight();
     }
     if (width < 2 || height < 2) return false;
 
@@ -1074,47 +1339,41 @@ inline bool encodeNativeGif(
     cfg.effFps = std::clamp(fps, 1, 50);
 
     if (cfg.qualityMode == 0) {
-        cfg.effFps = std::min(cfg.effFps, 12);
-        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 720;
-        cfg.maxColors = 64;
-        cfg.dedupeTol = 6;
-        cfg.stabTol = 6;
-        cfg.lossyLevel = 2;
-        cfg.targetMaxBytes = 6ull * 1024 * 1024;
+        cfg.effFps = std::min(cfg.effFps, 10);
+        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 2560;
+        cfg.maxColors = 63;
+        cfg.dedupeTol = 7;
+        cfg.stabTol = 10;
+        cfg.lossyStrength = 80;
+        cfg.targetMaxBytes = 8ull * 1024 * 1024;
     } else if (cfg.qualityMode == 1) {
         cfg.effFps = std::min(cfg.effFps, 15);
-        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 1080;
-        cfg.maxColors = 96;
+        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 2560;
+        cfg.maxColors = 127;
         cfg.dedupeTol = 5;
-        cfg.stabTol = 5;
-        cfg.lossyLevel = 1;
-        cfg.targetMaxBytes = 12ull * 1024 * 1024;
+        cfg.stabTol = 7;
+        cfg.lossyStrength = 45;
+        cfg.targetMaxBytes = 15ull * 1024 * 1024;
     } else if (cfg.qualityMode == 2) {
-        if (estDurationSec > 6.0) cfg.effFps = std::min(cfg.effFps, 20);
-        cfg.effMaxWidth = maxWidth;
-        cfg.maxColors = 128;
+        cfg.effFps = std::min(cfg.effFps, 20);
+        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 2560;
+        cfg.maxColors = 255;
         cfg.dedupeTol = 4;
-        cfg.stabTol = 3;
-        cfg.lossyLevel = 1;
+        cfg.stabTol = 4;
+        cfg.lossyStrength = 25;
         cfg.targetMaxBytes = 25ull * 1024 * 1024;
-        // 超高分辨率长视频首轮预缩放，避免首轮扫描耗时过长
-        if (cfg.effMaxWidth == 0 && estDurationSec > 4.0) {
-            double pixelBudget = double(width) * double(height) * double(cfg.effFps) * estDurationSec;
-            if (pixelBudget > 700e6) cfg.effMaxWidth = 1280;
-            else if (pixelBudget > 350e6) cfg.effMaxWidth = 1600;
-        }
     } else {
         cfg.effMaxWidth = maxWidth;
         cfg.maxColors = 256;
         cfg.dedupeTol = 0;
         cfg.stabTol = 0;
-        cfg.lossyLevel = 0;
+        cfg.lossyStrength = 0;
         cfg.targetMaxBytes = 0;
     }
 
     AttemptOutcome outcome;
     int attempts = 0;
-    const int maxAttempts = cfg.targetMaxBytes > 0 ? 3 : 1;
+    const int maxAttempts = cfg.targetMaxBytes > 0 ? 4 : 1;
     while (attempts < maxAttempts) {
         bool allowAbort = (attempts + 1 < maxAttempts);
         outcome = encodeNativeGifAttempt(tool, video, gif, width, height, cfg, allowAbort);
@@ -1128,7 +1387,7 @@ inline bool encodeNativeGif(
     stats << "\nGIF fast width=" << outcome.outW << " height=" << outcome.outH
           << " src_w=" << width << " src_h=" << height
           << " fps=" << cfg.effFps << " colors=" << outcome.colors
-          << " mode=" << cfg.qualityMode << " lossy=" << cfg.lossyLevel
+          << " mode=" << cfg.qualityMode << " lossy=" << cfg.lossyStrength
           << " attempts=" << attempts
           << " frames_read=" << outcome.readFrames << " frames_written=" << outcome.framesWritten
           << " file_bytes=" << outcome.fileBytes

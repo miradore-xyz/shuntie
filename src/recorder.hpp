@@ -15,6 +15,7 @@ struct RecordingStatus {
     ULONGLONG started=0;
     ULONGLONG elapsedMs=0;
     uint64_t exportedBytes=0;
+    uint64_t videoBytes=0;
     unsigned copyVersion=0;
 };
 class Recorder {

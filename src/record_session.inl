@@ -27,7 +27,7 @@ bool mergeSegments(const std::wstring& ff,const std::vector<std::wstring>& segme
 bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstring& video,const std::wstring& gif,const std::wstring& log,int fps,int width,int height,int gifQuality=1){
     fps=std::clamp(fps,1,50);
     int mode=std::clamp(gifQuality,0,3);
-    int maxWidth=mode==0?720:mode==1?1080:0;
+    int maxWidth=0;
     std::wstring helper=gifski.substr(0,gifski.find_last_of(L"\\/"))+L"\\gifski-export.exe";if(nonempty(helper)){Child process;return launch(process,helper,quote(ff)+L" "+quote(gifski)+L" "+quote(video)+L" "+quote(gif)+L" "+quote(log)+L" "+std::to_wstring(fps)+L" "+std::to_wstring(width)+L" "+std::to_wstring(height)+L" "+std::to_wstring(maxWidth)+L" "+std::to_wstring(mode),log)&&result(process)==0&&nonempty(gif);}
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
     Child encoder,decoder;bool enc=launch(encoder,gifski,L"--quiet --quality 90 --width "+std::to_wstring(width)+L" --height "+std::to_wstring(height)+L" --fps "+std::to_wstring(fps)+L" -o "+quote(gif)+L" -",log,read);CloseHandle(read);
@@ -81,7 +81,7 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int g
             if(isVideo){
                 update(RecordingStatus::Exporting,L"正在压缩并复制视频…");std::wstring snapVideo=base+L"_快照"+std::to_wstring(++snapshot)+L".mp4";
                 bool ok=exportVideoOutput(snapVideo);if(ok){exportedSegments=segments.size();lastSnapshot=snapVideo;}
-                {std::lock_guard<std::mutex> lock(mutex);if(ok){current.video=snapVideo;current.exportedBytes=fileSizeBytes(snapVideo);++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"视频已生成，录制保持暂停":L"视频导出失败，可重试或继续录制";}
+                {std::lock_guard<std::mutex> lock(mutex);if(ok){current.video=snapVideo;current.exportedBytes=fileSizeBytes(snapVideo);current.videoBytes=current.exportedBytes;++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"视频已生成，录制保持暂停":L"视频导出失败，可重试或继续录制";}
             }else{
                 update(RecordingStatus::Exporting,L"正在生成并复制 GIF…");std::wstring gif=base+L"_快照"+std::to_wstring(++snapshot)+L".gif";
                 bool ok=mergeSegments(ff,segments,video,log)&&encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality);if(ok){exportedSegments=segments.size();lastSnapshot=gif;}
@@ -99,14 +99,16 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int g
         if(!ready&&!exportVideoOutput(video)){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
         for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
         uint64_t finalBytes=fileSizeBytes(video);
-        {std::lock_guard<std::mutex> lock(mutex);current.gif.clear();current.video=video;current.exportedBytes=finalBytes;current.phase=RecordingStatus::Complete;current.message=L"视频已导出 · "+formatFileSizeMB(finalBytes);}
+        {std::lock_guard<std::mutex> lock(mutex);current.gif.clear();current.video=video;current.exportedBytes=finalBytes;current.videoBytes=finalBytes;current.phase=RecordingStatus::Complete;current.message=L"视频已导出 · "+formatFileSizeMB(finalBytes);}
     }else{
         update(RecordingStatus::Exporting,L"正在保存视频并导出 GIF…");std::wstring gif=base+L".gif";
         bool ready=exportedSegments==segments.size()&&!lastSnapshot.empty()&&nonempty(video)&&CopyFileW(lastSnapshot.c_str(),gif.c_str(),FALSE);
         if(!ready&&(!mergeSegments(ff,segments,video,log)||!encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality))){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
+        update(RecordingStatus::Exporting,L"正在压缩视频文件…");
+        compressVideoToLimit(ff,video,video,log,elapsed,width,height,kVideoMaxBytes);
         // 成功输出完整视频和 GIF 后才清理本次会话的片段文件。
         for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
-        uint64_t finalBytes=fileSizeBytes(gif);
-        {std::lock_guard<std::mutex> lock(mutex);current.gif=gif;current.video=video;current.exportedBytes=finalBytes;current.phase=RecordingStatus::Complete;current.message=L"GIF 已导出 · "+formatFileSizeMB(finalBytes);}
+        uint64_t finalGifBytes=fileSizeBytes(gif),finalVideoBytes=fileSizeBytes(video);
+        {std::lock_guard<std::mutex> lock(mutex);current.gif=gif;current.video=video;current.exportedBytes=finalGifBytes;current.videoBytes=finalVideoBytes;current.phase=RecordingStatus::Complete;current.message=L"已导出 · GIF "+formatFileSizeMB(finalGifBytes)+L" · MP4 "+formatFileSizeMB(finalVideoBytes);}
     }
 }

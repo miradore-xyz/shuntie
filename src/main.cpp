@@ -33,17 +33,18 @@ HFONT uiFont=nullptr;
 HICON appIcon=nullptr;
 HICON smallIcon=nullptr;
 NOTIFYICONDATAW tray{};
-bool captureHotkey=false,pinHotkey=false,recordHotkey=false,scrollAutoMode=false,showClickEffect=true;
+constexpr int kHotkeyCount=5;
+bool hotkeyOk[kHotkeyCount]{},scrollAutoMode=false,showClickEffect=true;
 Image lastImage;
 Image brandImage;
 float mainScale=1;
 int gifFps=15,gifQuality=1,waitingHotkey=0;
-UINT keyModifiers[]={0,0,MOD_ALT},keyCodes[]={VK_F1,VK_F3,'G'};
-enum Command {Capture=101,PinClipboard,Record,Folder,Hide,Exit,CopyGif,OpenVideo,FrameRate,LongCapture,RecordVideo,
+UINT keyModifiers[kHotkeyCount]={0,0,MOD_ALT,MOD_ALT,MOD_ALT},keyCodes[kHotkeyCount]={VK_F1,VK_F3,'G','L','V'};
+enum Command {Capture=101,PinClipboard,Record,Folder,Hide,Exit,CopyGif,CopyVideo,OpenVideo,FrameRate,LongCapture,RecordVideo,
     Select=201,Rectangle,Arrow,Pen,Mosaic,Color,Thickness,Undo,Redo,Copy,Save,Pin,Reselect,Cancel,StartRecord,StartVideo,StopRecord,
     ScrollAuto=251,ScrollCopy,ScrollSave,ScrollPin,ScrollCancel,
-    Settings=301,Back,FpsToggle,AutoStart,KeyCapture,KeyPin,KeyRecord,GifQualityToggle,ClickEffectToggle};
-constexpr int ClearCapture=311,ClearPin=312,ClearRecord=313,PauseRecord=320,CopyRecording=321,ToggleClicks=322;
+    Settings=301,Back,FpsToggle,AutoStart,KeyCapture,KeyPin,KeyRecord,KeyScroll,KeyVideo,GifQualityToggle=316,ClickEffectToggle=317};
+constexpr int ClearCapture=311,ClearPin=312,ClearRecord=313,ClearScroll=314,ClearVideo=315,PauseRecord=320,CopyRecording=321,ToggleClicks=322;
 constexpr int Language=330;
 void showMain();void beginCapture(CaptureMode mode);inline void beginCapture(bool recording){beginCapture(recording?CaptureMode::Record:CaptureMode::Screenshot);}void pinImage(Image image);void finishCapture(int action);void refreshStatus();
 void showSettings();void registerKeys();void mainCommand(int id);
@@ -66,20 +67,20 @@ HWND button(HWND parent,int id,const wchar_t* label,int x,int y,int w,int h,bool
 void drawButton(DRAWITEMSTRUCT* d){
     bool disabled=(d->itemState&ODS_DISABLED)!=0,down=(d->itemState&ODS_SELECTED)!=0;
     bool inStrip=isEditorStrip(d->hwndItem);
-    bool primary=d->CtlID==CopyGif||(!inStrip&&(d->CtlID==Copy||d->CtlID==StartRecord||d->CtlID==StartVideo));
+    bool primary=d->CtlID==CopyGif||(d->CtlID==CopyVideo&&recorder.status().mode==RecordingStatus::Video)||(!inStrip&&(d->CtlID==Copy||d->CtlID==StartRecord||d->CtlID==StartVideo));
     COLORREF bg=disabled?RGB(28,33,39):primary?(down?RGB(87,184,153):RGB(124,230,197)):(down?RGB(53,61,70):RGB(36,42,50));
     HBRUSH brush=CreateSolidBrush(bg);HPEN pen=CreatePen(PS_SOLID,1,bg);HGDIOBJ oldBrush=SelectObject(d->hDC,brush),oldPen=SelectObject(d->hDC,pen);
     RoundRect(d->hDC,d->rcItem.left,d->rcItem.top,d->rcItem.right,d->rcItem.bottom,10,10);
     SelectObject(d->hDC,oldBrush);SelectObject(d->hDC,oldPen);DeleteObject(brush);DeleteObject(pen);
-    Icon icon=Icon::scan_line;bool hasIcon=true,iconOnly=d->CtlID==Settings||d->CtlID==Back||inStrip||(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord)||GetParent(d->hwndItem)==recordPanel||GetParent(d->hwndItem)==scrollPanel||GetParent(d->hwndItem)==overlay;
-    switch(d->CtlID){case Settings:case FpsToggle:case GifQualityToggle:case Thickness:icon=Icon::sliders_horizontal;break;case Back:case Cancel:case ScrollCancel:case Exit:icon=Icon::x;break;case Capture:case KeyCapture:case Reselect:icon=Icon::scan_line;break;case PinClipboard:case KeyPin:icon=Icon::clipboard_paste;break;case Record:case KeyRecord:case StartRecord:icon=Icon::video;break;case RecordVideo:case StartVideo:case OpenVideo:icon=Icon::film;break;case Copy:case CopyGif:case ScrollCopy:icon=Icon::copy;break;case Folder:icon=Icon::folder_open;break;case Hide:icon=Icon::minus;break;case Select:icon=Icon::mouse_pointer_2;break;case Rectangle:icon=Icon::square;break;case Arrow:icon=Icon::move_up_right;break;case Pen:icon=Icon::pencil;break;case Mosaic:icon=Icon::grid_2x2;break;case Color:icon=Icon::palette;break;case Undo:icon=Icon::undo_2;break;case Redo:icon=Icon::redo_2;break;case Save:case ScrollSave:icon=Icon::save;break;case Pin:case ScrollPin:icon=Icon::pin;break;case LongCapture:icon=Icon::chevrons_down;break;case ToggleClicks:case ClickEffectToggle:icon=Icon::mouse_pointer_click;break;case StopRecord:icon=Icon::circle_stop;break;default:hasIcon=false;}
-    if(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord){icon=Icon::x;hasIcon=true;}if(d->CtlID==CopyRecording){icon=Icon::copy;hasIcon=true;}if(d->CtlID==PauseRecord){icon=recorder.status().phase==RecordingStatus::Paused?Icon::play:Icon::pause;hasIcon=true;}if(d->CtlID==ScrollAuto){icon=scrollAutoMode?Icon::pause:Icon::play;hasIcon=true;}
+    Icon icon=Icon::scan_line;bool hasIcon=true,iconOnly=d->CtlID==Settings||d->CtlID==Back||inStrip||(d->CtlID>=ClearCapture&&d->CtlID<=ClearVideo)||GetParent(d->hwndItem)==recordPanel||GetParent(d->hwndItem)==scrollPanel||GetParent(d->hwndItem)==overlay;
+    switch(d->CtlID){case Settings:case FpsToggle:case GifQualityToggle:case Thickness:icon=Icon::sliders_horizontal;break;case Back:case Cancel:case ScrollCancel:case Exit:icon=Icon::x;break;case Capture:case KeyCapture:case Reselect:icon=Icon::scan_line;break;case PinClipboard:case KeyPin:icon=Icon::clipboard_paste;break;case Record:case KeyRecord:case StartRecord:icon=Icon::video;break;case RecordVideo:case StartVideo:case KeyVideo:case OpenVideo:icon=Icon::film;break;case Copy:case CopyGif:case CopyVideo:case ScrollCopy:icon=Icon::copy;break;case Folder:icon=Icon::folder_open;break;case Hide:icon=Icon::minus;break;case Select:icon=Icon::mouse_pointer_2;break;case Rectangle:icon=Icon::square;break;case Arrow:icon=Icon::move_up_right;break;case Pen:icon=Icon::pencil;break;case Mosaic:icon=Icon::grid_2x2;break;case Color:icon=Icon::palette;break;case Undo:icon=Icon::undo_2;break;case Redo:icon=Icon::redo_2;break;case Save:case ScrollSave:icon=Icon::save;break;case Pin:case ScrollPin:icon=Icon::pin;break;case LongCapture:case KeyScroll:icon=Icon::chevrons_down;break;case ToggleClicks:case ClickEffectToggle:icon=Icon::mouse_pointer_click;break;case StopRecord:icon=Icon::circle_stop;break;default:hasIcon=false;}
+    if(d->CtlID>=ClearCapture&&d->CtlID<=ClearVideo){icon=Icon::x;hasIcon=true;}if(d->CtlID==CopyRecording){icon=Icon::copy;hasIcon=true;}if(d->CtlID==PauseRecord){icon=recorder.status().phase==RecordingStatus::Paused?Icon::play:Icon::pause;hasIcon=true;}if(d->CtlID==ScrollAuto){icon=scrollAutoMode?Icon::pause:Icon::play;hasIcon=true;}
     float scale=float(GetDpiForWindow(d->hwndItem))/96,iw=(iconOnly?21:18)*scale,h=float(d->rcItem.bottom-d->rcItem.top),w=float(d->rcItem.right-d->rcItem.left);
     ID2D1DCRenderTarget* rt=nullptr;auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE),96,96);d2d->CreateDCRenderTarget(&properties,&rt);
     if(rt){rt->BindDC(d->hDC,&d->rcItem);rt->BeginDraw();rt->Clear(rgb(inStrip?0x20262E:BG));bool activeStrip=isToolSelected(d->CtlID)||d->CtlID==Copy||d->CtlID==ScrollCopy||(d->CtlID==ToggleClicks&&showClickEffect)||(d->CtlID==ScrollAuto&&scrollAutoMode);unsigned fg=disabled?0x73808D:primary?0x11251E:inStrip&&activeStrip?ACCENT:INK;
         ID2D1SolidColorBrush* surface=nullptr;bool hover=hoveredButton==d->hwndItem;unsigned background=inStrip?(down?0x353D46:hover?0x2D3641:0x20262E):disabled?0x1C2127:primary?(down?0x57B899:ACCENT):(down?0x353D46:hover?0x303943:0x242A32);rt->CreateSolidColorBrush(rgb(background),&surface);if(surface){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0,0,w,h),7*scale,7*scale),surface);release(surface);}
         if(hasIcon)drawIcon(rt,icon,iconOnly?(w-iw)/2:12*scale,(h-iw)/2,iw,fg);
-        if(!iconOnly){wchar_t label[128];GetWindowTextW(d->hwndItem,label,128);IDWriteTextFormat* format=nullptr;ID2D1SolidColorBrush* b=nullptr;writeFactory->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*scale,L"zh-cn",&format);rt->CreateSolidColorBrush(rgb(fg),&b);if(format&&b){format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);rt->DrawText(label,UINT(wcslen(label)),format,D2D1::RectF(0,0,w,h),b);}release(format);release(b);}
+        if(!iconOnly){wchar_t label[128];GetWindowTextW(d->hwndItem,label,128);IDWriteTextFormat* format=nullptr;ID2D1SolidColorBrush* b=nullptr;writeFactory->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*scale,L"zh-cn",&format);rt->CreateSolidColorBrush(rgb(fg),&b);if(format&&b){format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);D2D1_RECT_F textRect=(hasIcon&&w<190*scale)?D2D1::RectF(26*scale,0,w-4*scale,h):D2D1::RectF(0,0,w,h);rt->DrawText(label,UINT(wcslen(label)),format,textRect,b);}release(format);release(b);}
         if((d->itemState&ODS_FOCUS)&&!(d->itemState&ODS_NOFOCUSRECT)){rt->CreateSolidColorBrush(rgb(ACCENT),&surface);if(surface){rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(2,2,w-2,h-2),6,6),surface,1);release(surface);}}
         rt->EndDraw();release(rt);
     }
@@ -296,17 +297,19 @@ std::wstring keyLabel(int i){
     wchar_t key[64]{};UINT scan=MapVirtualKeyW(keyCodes[i],MAPVK_VK_TO_VSC);GetKeyNameTextW(LONG(scan<<16),key,64);return label+key;
 }
 void registerKeys(){
-    bool* flags[]={&captureHotkey,&pinHotkey,&recordHotkey};std::wstring ini=root+L"\\settings.ini";
-    for(int i=0;i<3;++i){UnregisterHotKey(mainWindow,i+1);*flags[i]=!keyCodes[i]||RegisterHotKey(mainWindow,i+1,keyModifiers[i]|MOD_NOREPEAT,keyCodes[i]);
+    std::wstring ini=root+L"\\settings.ini";
+    for(int i=0;i<kHotkeyCount;++i){UnregisterHotKey(mainWindow,i+1);hotkeyOk[i]=!keyCodes[i]||RegisterHotKey(mainWindow,i+1,keyModifiers[i]|MOD_NOREPEAT,keyCodes[i]);
         WritePrivateProfileStringW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),std::to_wstring(keyCodes[i]).c_str(),ini.c_str());WritePrivateProfileStringW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),std::to_wstring(keyModifiers[i]).c_str(),ini.c_str());}
 }
 bool autoStartEnabled(){HKEY key=nullptr;bool enabled=false;if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_READ,&key)==ERROR_SUCCESS){enabled=RegQueryValueExW(key,L"Shuntie",nullptr,nullptr,nullptr,nullptr)==ERROR_SUCCESS;RegCloseKey(key);}return enabled;}
 bool setAutoStart(bool enabled){HKEY key=nullptr;if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)!=ERROR_SUCCESS)return false;LONG status;
     if(enabled){std::wstring command=L"\""+root+L"\\瞬贴.exe\" --tray";status=RegSetValueExW(key,L"Shuntie",0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),DWORD((command.size()+1)*sizeof(wchar_t)));}else{status=RegDeleteValueW(key,L"Shuntie");if(status==ERROR_FILE_NOT_FOUND)status=ERROR_SUCCESS;}RegCloseKey(key);return status==ERROR_SUCCESS;}
 void settingsLabels(){
-    if(!settingsWindow)return;for(int i=0;i<3;++i){const wchar_t* labels[]={L"截图  ",L"贴图  ",L"录屏  "};bool available=i==0?captureHotkey:i==1?pinHotkey:recordHotkey;setLabel(GetDlgItem(settingsWindow,KeyCapture+i),(labels[i]+(waitingHotkey==i+1?L"请按新的快捷键…":keyLabel(i)+(available?L"":L"（占用）"))).c_str());}
+    if(!settingsWindow)return;
+    const wchar_t* labels[]={L"截图  ",L"贴图  ",L"录 GIF  ",L"长截图  ",L"录视频  "};
+    for(int i=0;i<kHotkeyCount;++i){bool available=hotkeyOk[i];setLabel(GetDlgItem(settingsWindow,KeyCapture+i),(labels[i]+(waitingHotkey==i+1?L"请按新的快捷键…":keyLabel(i)+(available?L"":L"（占用）"))).c_str());}
     setLabel(GetDlgItem(settingsWindow,FpsToggle),(L"GIF 帧率   "+std::to_wstring(gifFps)+L" 帧/秒").c_str());
-    const wchar_t* qLabel=gifQuality==0?L"GIF 画质   小体积 (≤6MB)":gifQuality==1?L"GIF 画质   均衡 (≤12MB)":L"GIF 画质   高清 (≤25MB)";
+    const wchar_t* qLabel=gifQuality==0?L"GIF 画质   2K 小体积 (≤8MB)":gifQuality==1?L"GIF 画质   2K 均衡 (≤15MB)":L"GIF 画质   2K 原画 (≤25MB)";
     setLabel(GetDlgItem(settingsWindow,GifQualityToggle),qLabel);
     setLabel(GetDlgItem(settingsWindow,ClickEffectToggle),showClickEffect?L"鼠标点击显示   已开启":L"鼠标点击显示   已关闭");
     setLabel(GetDlgItem(settingsWindow,AutoStart),autoStartEnabled()?L"开机启动   已开启":L"开机启动   已关闭");InvalidateRect(settingsWindow,nullptr,FALSE);
@@ -314,9 +317,13 @@ void settingsLabels(){
 LRESULT CALLBACK settingsProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     static ID2D1HwndRenderTarget* rt=nullptr;float s=mainScale;
     switch(msg){
-    case WM_CREATE:{auto add=[&](int id,const wchar_t* label,int x,int y,int w,int h){button(hwnd,id,label,int(x*s),int(y*s),int(w*s),int(h*s));};add(Back,L"关闭设置",286,18,34,34);add(Language,english?L"简体中文":L"English",200,60,120,25);add(KeyCapture,L"截图",24,92,252,40);add(KeyPin,L"贴图",24,140,252,40);add(KeyRecord,L"录屏",24,188,252,40);add(ClearCapture,L"清除截图快捷键",284,92,36,40);add(ClearPin,L"清除贴图快捷键",284,140,36,40);add(ClearRecord,L"清除录屏快捷键",284,188,36,40);add(FpsToggle,L"GIF 帧率",24,248,296,38);add(GifQualityToggle,L"GIF 画质",24,294,296,38);add(ClickEffectToggle,L"鼠标点击显示",24,340,296,38);add(AutoStart,L"开机启动",24,386,296,38);add(Folder,L"输出目录",24,446,140,38);add(Hide,L"收起",180,446,140,38);add(Exit,L"退出软件",24,498,296,38);return 0;}
+    case WM_CREATE:{auto add=[&](int id,const wchar_t* label,int x,int y,int w,int h){button(hwnd,id,label,int(x*s),int(y*s),int(w*s),int(h*s));};add(Back,L"关闭设置",286,18,34,34);add(Language,english?L"简体中文":L"English",200,56,120,24);
+        const std::pair<int,const wchar_t*> keyRows[]={{KeyCapture,L"截图"},{KeyPin,L"贴图"},{KeyRecord,L"录 GIF"},{KeyScroll,L"长截图"},{KeyVideo,L"录视频"}};
+        const std::pair<int,const wchar_t*> clearRows[]={{ClearCapture,L"清除截图快捷键"},{ClearPin,L"清除贴图快捷键"},{ClearRecord,L"清除录屏快捷键"},{ClearScroll,L"清除长截图快捷键"},{ClearVideo,L"清除录视频快捷键"}};
+        for(int i=0;i<kHotkeyCount;++i){int y=86+i*40;add(keyRows[i].first,keyRows[i].second,24,y,252,34);add(clearRows[i].first,clearRows[i].second,284,y,36,34);}
+        add(FpsToggle,L"GIF 帧率",24,294,296,36);add(GifQualityToggle,L"GIF 画质",24,336,296,36);add(ClickEffectToggle,L"鼠标点击显示",24,378,296,36);add(AutoStart,L"开机启动",24,420,296,36);add(Folder,L"输出目录",24,470,140,36);add(Hide,L"收起",180,470,140,36);add(Exit,L"退出软件",24,514,296,36);return 0;}
     case WM_DRAWITEM:drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));return TRUE;
-    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());EnumChildWindows(mainWindow,[](HWND control,LPARAM)->BOOL{wchar_t label[256]{};GetWindowTextW(control,label,256);setLabel(control,label);return TRUE;},0);setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearRecord){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyRecord){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==10?15:gifFps==15?20:gifFps==20?30:10;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==GifQualityToggle){gifQuality=(gifQuality+1)%3;WritePrivateProfileStringW(L"export",L"quality",std::to_wstring(gifQuality).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==ClickEffectToggle){showClickEffect=!showClickEffect;WritePrivateProfileStringW(L"record",L"show_clicks",showClickEffect?L"1":L"0",(root+L"\\settings.ini").c_str());clickOverlay.setEnabled(showClickEffect);if(recordPanel){setLabel(GetDlgItem(recordPanel,ToggleClicks),showClickEffect?L"点击提示：显示中（点击切换）":L"点击提示：已隐藏（点击切换）");InvalidateRect(GetDlgItem(recordPanel,ToggleClicks),nullptr,FALSE);}settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
+    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());setLabel(GetDlgItem(mainWindow,Capture),L"截图");setLabel(GetDlgItem(mainWindow,LongCapture),L"长截图");setLabel(GetDlgItem(mainWindow,Record),L"录 GIF");setLabel(GetDlgItem(mainWindow,RecordVideo),L"录视频");setLabel(GetDlgItem(mainWindow,CopyGif),L"复制 GIF");setLabel(GetDlgItem(mainWindow,CopyVideo),L"复制视频");setLabel(GetDlgItem(mainWindow,OpenVideo),L"打开视频");setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearVideo){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyVideo){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==10?15:gifFps==15?20:gifFps==20?30:10;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==GifQualityToggle){gifQuality=(gifQuality+1)%3;WritePrivateProfileStringW(L"export",L"quality",std::to_wstring(gifQuality).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==ClickEffectToggle){showClickEffect=!showClickEffect;WritePrivateProfileStringW(L"record",L"show_clicks",showClickEffect?L"1":L"0",(root+L"\\settings.ini").c_str());clickOverlay.setEnabled(showClickEffect);if(recordPanel){setLabel(GetDlgItem(recordPanel,ToggleClicks),showClickEffect?L"点击提示：显示中（点击切换）":L"点击提示：已隐藏（点击切换）");InvalidateRect(GetDlgItem(recordPanel,ToggleClicks),nullptr,FALSE);}settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
     case WM_SYSKEYDOWN:case WM_KEYDOWN:
         if(waitingHotkey){if(wp==VK_ESCAPE){waitingHotkey=0;settingsLabels();return 0;}if(wp==VK_CONTROL||wp==VK_SHIFT||wp==VK_MENU||wp==VK_LWIN||wp==VK_RWIN)return 0;
         int i=waitingHotkey-1;UINT mod=(GetKeyState(VK_CONTROL)<0?MOD_CONTROL:0)|(GetKeyState(VK_MENU)<0?MOD_ALT:0)|(GetKeyState(VK_SHIFT)<0?MOD_SHIFT:0);UINT oldKey=keyCodes[i],oldMod=keyModifiers[i];UnregisterHotKey(mainWindow,i+1);
@@ -326,17 +333,28 @@ LRESULT CALLBACK settingsProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_LBUTTONDOWN:ReleaseCapture();SendMessageW(GetAncestor(hwnd,GA_ROOT),WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;
     case WM_WINDOWPOSCHANGING:if(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_CHILD){auto p=reinterpret_cast<WINDOWPOS*>(lp);p->x=0;p->y=0;}return 0;
     case WM_SIZE:roundWindow(hwnd);if(rt)rt->Resize(D2D1::SizeU(LOWORD(lp),HIWORD(lp)));return 0;
-    case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(s,s));rt->Clear(rgb(BG));text(rt,L"设置",{24,22,250,58},21,INK,true);text(rt,L"点击修改快捷键",{24,62,190,85},12,MUTED);if(FAILED(rt->EndDraw()))release(rt);}EndPaint(hwnd,&ps);return 0;}
+    case WM_PAINT:{PAINTSTRUCT ps;BeginPaint(hwnd,&ps);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(s,s));rt->Clear(rgb(BG));text(rt,L"设置",{24,20,250,54},21,INK,true);text(rt,L"点击修改快捷键",{24,58,190,80},12,MUTED);if(FAILED(rt->EndDraw()))release(rt);}EndPaint(hwnd,&ps);return 0;}
     case WM_ERASEBKGND:return 1;
-    case WM_DESTROY:settingsWindow=nullptr;waitingHotkey=0;release(rt);ShowWindow(GetDlgItem(mainWindow,Settings),SW_SHOW);refreshStatus();RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;
+    case WM_DESTROY:settingsWindow=nullptr;waitingHotkey=0;release(rt);for(int id:{int(Settings),int(Capture),int(LongCapture),int(Record),int(RecordVideo)})ShowWindow(GetDlgItem(mainWindow,id),SW_SHOW);refreshStatus();RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;
     }return DefWindowProcW(hwnd,msg,wp,lp);
 }
-void showSettings(){if(settingsWindow){SetFocus(settingsWindow);return;}SendMessageW(mainWindow,WM_SETREDRAW,FALSE,0);ShowWindow(GetDlgItem(mainWindow,Settings),SW_HIDE);ShowWindow(GetDlgItem(mainWindow,CopyGif),SW_HIDE);ShowWindow(GetDlgItem(mainWindow,OpenVideo),SW_HIDE);SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(568*mainScale),SWP_NOMOVE|SWP_NOZORDER);settingsWindow=CreateWindowExW(0,L"ShuntieSettings",L"瞬贴 · 设置",WS_CHILD|WS_CLIPCHILDREN,0,0,int(344*mainScale),int(568*mainScale),mainWindow,nullptr,instance,nullptr);settingsLabels();ShowWindow(settingsWindow,SW_SHOW);SendMessageW(mainWindow,WM_SETREDRAW,TRUE,0);RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);SetFocus(settingsWindow);}
+void showSettings(){if(settingsWindow){SetFocus(settingsWindow);return;}SendMessageW(mainWindow,WM_SETREDRAW,FALSE,0);for(int id:{int(Settings),int(Capture),int(LongCapture),int(Record),int(RecordVideo),int(CopyGif),int(CopyVideo),int(OpenVideo)})ShowWindow(GetDlgItem(mainWindow,id),SW_HIDE);SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(572*mainScale),SWP_NOMOVE|SWP_NOZORDER);settingsWindow=CreateWindowExW(0,L"ShuntieSettings",L"瞬贴 · 设置",WS_CHILD|WS_CLIPCHILDREN,0,0,int(344*mainScale),int(572*mainScale),mainWindow,nullptr,instance,nullptr);settingsLabels();ShowWindow(settingsWindow,SW_SHOW);SendMessageW(mainWindow,WM_SETREDRAW,TRUE,0);RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);SetFocus(settingsWindow);}
 void layoutMain(HWND hwnd){
     float s=mainScale;MoveWindow(GetDlgItem(hwnd,Settings),int(286*s),int(20*s),int(34*s),int(34*s),TRUE);
+    MoveWindow(GetDlgItem(hwnd,Capture),int(24*s),int(152*s),int(144*s),int(38*s),TRUE);
+    MoveWindow(GetDlgItem(hwnd,LongCapture),int(176*s),int(152*s),int(144*s),int(38*s),TRUE);
+    MoveWindow(GetDlgItem(hwnd,Record),int(24*s),int(196*s),int(144*s),int(38*s),TRUE);
+    MoveWindow(GetDlgItem(hwnd,RecordVideo),int(176*s),int(196*s),int(144*s),int(38*s),TRUE);
     bool isVideo=recorder.status().mode==RecordingStatus::Video;
-    MoveWindow(GetDlgItem(hwnd,CopyGif),int(24*s),int(214*s),int((isVideo?178:296)*s),int(42*s),TRUE);
-    MoveWindow(GetDlgItem(hwnd,OpenVideo),int(210*s),int(214*s),int(110*s),int(42*s),TRUE);
+    if(isVideo){
+        MoveWindow(GetDlgItem(hwnd,CopyGif),int(24*s),int(288*s),int(144*s),int(42*s),TRUE);
+        MoveWindow(GetDlgItem(hwnd,CopyVideo),int(24*s),int(288*s),int(178*s),int(42*s),TRUE);
+        MoveWindow(GetDlgItem(hwnd,OpenVideo),int(210*s),int(288*s),int(110*s),int(42*s),TRUE);
+    }else{
+        MoveWindow(GetDlgItem(hwnd,CopyGif),int(24*s),int(288*s),int(144*s),int(42*s),TRUE);
+        MoveWindow(GetDlgItem(hwnd,CopyVideo),int(176*s),int(288*s),int(144*s),int(42*s),TRUE);
+        MoveWindow(GetDlgItem(hwnd,OpenVideo),int(210*s),int(288*s),int(110*s),int(42*s),TRUE);
+    }
 }
 void refreshStatus(){
     static unsigned copiedVersion=0;auto latest=recorder.status();if(!latest.copyVersion)copiedVersion=0;if(latest.copyVersion>copiedVersion){bool isV=latest.mode==RecordingStatus::Video;const auto& path=isV?latest.video:latest.gif;if(copyFileToClipboard(mainWindow,path)){copiedVersion=latest.copyVersion;notice=std::wstring(isV?L"视频已复制":L"GIF 已复制")+(latest.exportedBytes?L" · "+formatFileSizeMB(latest.exportedBytes):L"");}else notice=isV?L"视频已生成，剪贴板繁忙，请重试复制":L"GIF 已生成，剪贴板繁忙，请重试复制";}
@@ -344,22 +362,25 @@ void refreshStatus(){
     static int lastCompletedMode=-1;static bool lastEnglish=false;
     if(!settingsWindow){
         if(completed){
-            int modeTag=isVideo?1:0;
+            int modeTag=isVideo?2:(!s.video.empty()?1:0);
             if(lastCompletedMode!=modeTag||lastEnglish!=english){
                 lastCompletedMode=modeTag;lastEnglish=english;
-                setLabel(GetDlgItem(mainWindow,CopyGif),isVideo?L"复制视频":L"复制 GIF");
+                setLabel(GetDlgItem(mainWindow,CopyGif),L"复制 GIF");
+                setLabel(GetDlgItem(mainWindow,CopyVideo),L"复制视频");
                 setLabel(GetDlgItem(mainWindow,OpenVideo),L"打开视频");
                 layoutMain(mainWindow);
             }
-            ShowWindow(GetDlgItem(mainWindow,CopyGif),SW_SHOW);
-            ShowWindow(GetDlgItem(mainWindow,OpenVideo),isVideo?SW_SHOW:SW_HIDE);
+            ShowWindow(GetDlgItem(mainWindow,CopyGif),isVideo?SW_HIDE:SW_SHOW);
+            ShowWindow(GetDlgItem(mainWindow,CopyVideo),(isVideo||!s.video.empty())?SW_SHOW:SW_HIDE);
+            ShowWindow(GetDlgItem(mainWindow,OpenVideo),(isVideo&&!s.video.empty())?SW_SHOW:SW_HIDE);
         }else{
             lastCompletedMode=-1;
             ShowWindow(GetDlgItem(mainWindow,CopyGif),SW_HIDE);
+            ShowWindow(GetDlgItem(mainWindow,CopyVideo),SW_HIDE);
             ShowWindow(GetDlgItem(mainWindow,OpenVideo),SW_HIDE);
         }
     }
-    int height=completed?280:(s.phase==RecordingStatus::Failed?250:180);RECT current;GetWindowRect(mainWindow,&current);if(!settingsWindow&&current.bottom-current.top!=int(height*mainScale))SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(height*mainScale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    int height=completed?348:(s.phase==RecordingStatus::Failed?312:252);RECT current;GetWindowRect(mainWindow,&current);if(!settingsWindow&&current.bottom-current.top!=int(height*mainScale))SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(height*mainScale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
     clickOverlay.setRecordingActive(s.phase==RecordingStatus::Recording);
     if(recordPanel){InvalidateRect(recordPanel,nullptr,FALSE);if(recordFrame)InvalidateRect(recordFrame,nullptr,FALSE);if(s.phase==RecordingStatus::Complete||s.phase==RecordingStatus::Failed||s.phase==RecordingStatus::Idle){DestroyWindow(recordPanel);recordPanel=nullptr;if(recordFrame){DestroyWindow(recordFrame);recordFrame=nullptr;}if(s.phase!=RecordingStatus::Idle)showMain();}}
     InvalidateRect(mainWindow,nullptr,FALSE);
@@ -370,7 +391,8 @@ void mainCommand(int id){
     case Capture:beginCapture(CaptureMode::Screenshot);break;case LongCapture:beginCapture(CaptureMode::Scroll);break;case PinClipboard:pinImage(clipboardImage(mainWindow));break;
     case Record:if(recorder.busy())recorder.stop();else beginCapture(CaptureMode::Record);break;
     case RecordVideo:if(recorder.busy())recorder.stop();else beginCapture(CaptureMode::RecordVideo);break;
-    case CopyGif:{auto s=recorder.status();bool isV=s.mode==RecordingStatus::Video;const auto& path=isV?s.video:s.gif;if(copyFileToClipboard(mainWindow,path))message(isV?L"视频文件已复制，可粘贴到聊天或编辑软件。":L"GIF 动图文件已复制，可粘贴到支持文件的聊天或编辑软件。");else showError(mainWindow,L"复制失败，请稍后重试。");break;}
+    case CopyGif:{auto s=recorder.status();if(copyFileToClipboard(mainWindow,s.gif))message(L"GIF 动图文件已复制，可粘贴到支持文件的聊天或编辑软件。");else showError(mainWindow,L"复制失败，请稍后重试。");break;}
+    case CopyVideo:{auto s=recorder.status();if(copyFileToClipboard(mainWindow,s.video))message(L"视频文件已复制，可粘贴到聊天或编辑软件。");else showError(mainWindow,L"复制失败，请稍后重试。");break;}
     case OpenVideo:{auto s=recorder.status();if(!s.video.empty())ShellExecuteW(mainWindow,L"open",s.video.c_str(),nullptr,nullptr,SW_SHOWNORMAL);break;}
     case Folder:ShellExecuteW(mainWindow,L"open",outputDir.c_str(),nullptr,nullptr,SW_SHOWNORMAL);break;
     case Hide:ShowWindow(mainWindow,SW_HIDE);break;case Exit:SendMessageW(mainWindow,WM_CLOSE,0,0);break;
@@ -381,27 +403,32 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     static ID2D1Bitmap* logo=nullptr;
     switch(msg){
     case WM_CREATE:{
-        button(hwnd,Settings,L"设置",0,0,0,0);button(hwnd,CopyGif,L"复制 GIF",0,0,0,0);button(hwnd,OpenVideo,L"打开视频",0,0,0,0);ShowWindow(GetDlgItem(hwnd,CopyGif),SW_HIDE);ShowWindow(GetDlgItem(hwnd,OpenVideo),SW_HIDE);SetTimer(hwnd,1,400,nullptr);layoutMain(hwnd);return 0;}
+        button(hwnd,Settings,L"设置",0,0,0,0);
+        button(hwnd,Capture,L"截图",0,0,0,0);button(hwnd,LongCapture,L"长截图",0,0,0,0);
+        button(hwnd,Record,L"录 GIF",0,0,0,0);button(hwnd,RecordVideo,L"录视频",0,0,0,0);
+        button(hwnd,CopyGif,L"复制 GIF",0,0,0,0);button(hwnd,CopyVideo,L"复制视频",0,0,0,0);button(hwnd,OpenVideo,L"打开视频",0,0,0,0);
+        ShowWindow(GetDlgItem(hwnd,CopyGif),SW_HIDE);ShowWindow(GetDlgItem(hwnd,CopyVideo),SW_HIDE);ShowWindow(GetDlgItem(hwnd,OpenVideo),SW_HIDE);
+        SetTimer(hwnd,1,400,nullptr);layoutMain(hwnd);return 0;}
     case WM_SIZE:roundWindow(hwnd);if(rt)rt->Resize(D2D1::SizeU(LOWORD(lp),HIWORD(lp)));return 0;
     case WM_DPICHANGED:mainScale=float(HIWORD(wp))/96;{RECT* r=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER);layoutMain(hwnd);}return 0;
     case WM_PAINT:{PAINTSTRUCT paint;BeginPaint(hwnd,&paint);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(mainScale,mainScale));rt->Clear(rgb(BG));
         // 统一使用嵌入的高清 Logo，图标资源包含 16 到 256 像素尺寸。
         if(!logo)logo=bitmapFor(rt,brandImage,true);if(logo)rt->DrawBitmap(logo,D2D1::RectF(20,17,70,67),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.8",{83,50,240,69},10,MUTED);
-        text(rt,L"截图、标注、贴图。",{24,87,320,116},19,INK);
-        text(rt,L"录下操作，一键复制 GIF 或视频。",{24,118,320,148},14,MUTED);
-        auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,166,320,167},0x2C333C);text(rt,notice.empty()?s.message:notice,{24,180,320,208},12,ACCENT);}
-        else if(s.phase==RecordingStatus::Failed)text(rt,s.message,{24,176,320,238},12,0xF0B879);
+        text(rt,L"截图、标注、贴图。",{24,82,320,110},19,INK);
+        text(rt,L"录下操作，一键复制 GIF 或视频。",{24,112,320,140},14,MUTED);
+        auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,248,320,249},0x2C333C);text(rt,notice.empty()?s.message:notice,{24,256,320,284},12,ACCENT);}
+        else if(s.phase==RecordingStatus::Failed)text(rt,s.message,{24,248,320,304},12,0xF0B879);
         if(FAILED(rt->EndDraw())){release(logo);release(rt);}
     }EndPaint(hwnd,&paint);return 0;}
     case WM_ERASEBKGND:return 1;case WM_DRAWITEM:drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));return TRUE;
     case WM_COMMAND:mainCommand(LOWORD(wp));return 0;
     case WM_LBUTTONDOWN:ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;
     case WM_TIMER:refreshStatus();return 0;
-    case WM_HOTKEY:if(wp==1)beginCapture(CaptureMode::Screenshot);if(wp==2)pinImage(clipboardImage(hwnd));if(wp==3){auto s=recorder.status();if(s.phase==RecordingStatus::Starting||s.phase==RecordingStatus::Recording)recorder.stop();else if(!recorder.busy())beginCapture(CaptureMode::Record);else showMain();}return 0;
+    case WM_HOTKEY:if(wp==1)beginCapture(CaptureMode::Screenshot);if(wp==2)pinImage(clipboardImage(hwnd));if(wp==3){auto s=recorder.status();if(s.phase==RecordingStatus::Starting||s.phase==RecordingStatus::Recording)recorder.stop();else if(!recorder.busy())beginCapture(CaptureMode::Record);else showMain();}if(wp==4){if(!recorder.busy())beginCapture(CaptureMode::Scroll);else showMain();}if(wp==5){auto s=recorder.status();if(s.phase==RecordingStatus::Starting||s.phase==RecordingStatus::Recording)recorder.stop();else if(!recorder.busy())beginCapture(CaptureMode::RecordVideo);else showMain();}return 0;
     case TRAY_MESSAGE:if(lp==WM_LBUTTONUP||lp==WM_LBUTTONDBLCLK)showMain();if(lp==WM_RBUTTONUP){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,Capture,localize(L"截图").c_str());AppendMenuW(menu,MF_STRING,LongCapture,localize(L"长截图").c_str());AppendMenuW(menu,MF_STRING,Record,localize(L"录 GIF / 停止").c_str());AppendMenuW(menu,MF_STRING,RecordVideo,localize(L"录视频 (MP4) / 停止").c_str());AppendMenuW(menu,MF_STRING,Hide,localize(L"显示主窗口").c_str());AppendMenuW(menu,MF_STRING,Exit,localize(L"退出").c_str());POINT p;GetCursorPos(&p);SetForegroundWindow(hwnd);int cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,hwnd,nullptr);DestroyMenu(menu);if(cmd==Hide)showMain();else if(cmd)mainCommand(cmd);}return 0;
     case WM_CLOSE:if(recorder.busy()){recorder.stop();showMain();message(L"正在完成当前录屏，导出后即可退出。");return 0;}if(scrollPanel)endScrollUI();if(settingsWindow)DestroyWindow(settingsWindow);DestroyWindow(hwnd);return 0;
-    case WM_DESTROY:endScrollUI();clickOverlay.stop();KillTimer(hwnd,1);Shell_NotifyIconW(NIM_DELETE,&tray);UnregisterHotKey(hwnd,1);UnregisterHotKey(hwnd,2);UnregisterHotKey(hwnd,3);release(logo);release(rt);PostQuitMessage(0);return 0;
+    case WM_DESTROY:endScrollUI();clickOverlay.stop();KillTimer(hwnd,1);Shell_NotifyIconW(NIM_DELETE,&tray);for(int i=1;i<=kHotkeyCount;++i)UnregisterHotKey(hwnd,i);release(logo);release(rt);PostQuitMessage(0);return 0;
     }return DefWindowProcW(hwnd,msg,wp,lp);
 }
 #include "record_ui.inl"
@@ -436,9 +463,9 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR args,int){
     WNDCLASSEXW paletteClass{};paletteClass.cbSize=sizeof(paletteClass);paletteClass.lpfnWndProc=paletteProc;paletteClass.hInstance=h;paletteClass.hCursor=LoadCursorW(nullptr,IDC_ARROW);paletteClass.lpszClassName=L"ShuntiePalette";RegisterClassExW(&paletteClass);
     for(auto c:classes){WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.lpfnWndProc=c.proc;wc.hInstance=h;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=appIcon;wc.hIconSm=smallIcon;wc.lpszClassName=c.name;if(!RegisterClassExW(&wc))return 1;}
     DWORD style=WS_POPUP|WS_CLIPCHILDREN;
-    RECT work;SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);int w=int(344*mainScale),he=int(180*mainScale);
+    RECT work;SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);int w=int(344*mainScale),he=int(252*mainScale);
     mainWindow=CreateWindowExW(0,L"ShuntieMain",L"瞬贴 · 截图与录屏",style,(work.right-w)/2,(work.bottom-he)/2,w,he,nullptr,nullptr,h,nullptr);if(!mainWindow)return 1;setLabel(mainWindow,L"瞬贴 · 截图与录屏");
-    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<3;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}
+    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<kHotkeyCount;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}
     int rawFps=GetPrivateProfileIntW(L"export",L"fps",15,ini.c_str());gifFps=(rawFps==10||rawFps==15||rawFps==20||rawFps==30)?rawFps:(rawFps<=12?10:rawFps<=17?15:rawFps<=25?20:30);
     gifQuality=std::clamp<int>(GetPrivateProfileIntW(L"export",L"quality",1,ini.c_str()),0,2);
     showClickEffect=GetPrivateProfileIntW(L"record",L"show_clicks",1,ini.c_str())!=0;

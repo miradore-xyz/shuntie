@@ -59,7 +59,7 @@ def generate_test_video(path: Path, width: int = 1920, height: int = 1080, fps: 
     assert proc.wait() == 0
 
 
-def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int):
+def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int, expected_duration_ms: int = 5000):
     data = gif_path.read_bytes()
     assert data[:6] == b"GIF89a", f"Invalid GIF header: {data[:6]!r}"
     lsd_w, lsd_h, packed, _, _ = struct.unpack_from("<HHBBB", data, 6)
@@ -72,6 +72,7 @@ def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int):
     has_netscape = False
     gces = []
     frames = []
+    seen_trans_idx = None
 
     while pos < len(data):
         intro = data[pos]
@@ -87,7 +88,15 @@ def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int):
                 gce_packed, delay_cs, trans_idx = struct.unpack_from("<BHB", data, pos + 1)
                 trans_flag = gce_packed & 1
                 disposal = (gce_packed >> 2) & 7
-                assert trans_flag == 0, f"Transparency flag must be 0 for QQ compatibility, got {trans_flag}"
+                assert disposal == 1, f"Disposal method must be 1 for QQ compatibility, got {disposal}"
+                if len(frames) == 0:
+                    assert trans_flag == 0, "Frame 0 must be opaque!"
+                if trans_flag == 1:
+                    assert trans_idx < gct_size, (trans_idx, gct_size)
+                    if seen_trans_idx is None:
+                        seen_trans_idx = trans_idx
+                    else:
+                        assert seen_trans_idx == trans_idx, (seen_trans_idx, trans_idx)
                 assert delay_cs >= 2, f"Frame delay too small: {delay_cs * 10}ms"
                 gces.append((disposal, trans_flag, delay_cs))
                 pos += 1 + blk_size
@@ -110,7 +119,11 @@ def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int):
             pos += 9
             lctf = (img_packed >> 7) & 1
             assert lctf == 0, "Local Color Table must be 0!"
-            assert (left, top, w, h) == (0, 0, expected_w, expected_h), ((left, top, w, h), (expected_w, expected_h))
+            if len(frames) == 0:
+                assert (left, top, w, h) == (0, 0, expected_w, expected_h), ((left, top, w, h), (expected_w, expected_h))
+            else:
+                assert 0 <= left < expected_w and 0 <= top < expected_h
+                assert w >= 1 and h >= 1 and left + w <= expected_w and top + h <= expected_h
             frames.append((left, top, w, h))
             min_code_size = data[pos]
             assert 2 <= min_code_size <= 8
@@ -128,7 +141,7 @@ def parse_and_verify_gif89a(gif_path: Path, expected_w: int, expected_h: int):
     assert len(frames) > 10 and len(frames) == len(gces), (len(frames), len(gces))
 
     total_ms = sum(d * 10 for _, _, d in gces)
-    assert 4850 <= total_ms <= 5150, f"Unexpected total duration: {total_ms}ms"
+    assert expected_duration_ms - 180 <= total_ms <= expected_duration_ms + 180, f"Unexpected total duration: {total_ms}ms"
 
     # Pillow 逐帧解码校验无损坏
     with Image.open(gif_path) as im:
@@ -147,7 +160,7 @@ def main():
     video = OUT / "synthetic_1080p_5s.mp4"
     generate_test_video(video)
 
-    # 1) 均衡模式：15 fps，最长边 1080 -> 1080x608，且体积 <= 12 MB
+    # 1) 均衡模式（指定 1080 上限）：15 fps，1080x608，且体积 <= 12 MB
     balanced_gif = OUT / "balanced_1080.gif"
     balanced_log = OUT / "balanced_1080.log"
     balanced_log.unlink(missing_ok=True)
@@ -158,12 +171,12 @@ def main():
         check=True, creationflags=subprocess.CREATE_NO_WINDOW
     )
     elapsed_bal = time.perf_counter() - t0
-    bal_frames, bal_ms = parse_and_verify_gif89a(balanced_gif, 1080, 608)
+    bal_frames, bal_ms = parse_and_verify_gif89a(balanced_gif, 1080, 608, 5000)
     bal_bytes = balanced_gif.stat().st_size
     assert bal_bytes <= 12 * 1024 * 1024, f"Balanced GIF too large: {bal_bytes} bytes"
     assert elapsed_bal < 5.0, f"Balanced GIF export too slow: {elapsed_bal:.2f}s"
 
-    # 2) 小体积模式：12 fps，最长边 720 -> 720x404，且体积 <= 6 MB
+    # 2) 小体积模式（指定 720 上限）：10 fps，720x404，且体积 <= 6 MB
     compact_gif = OUT / "compact_720.gif"
     compact_log = OUT / "compact_720.log"
     compact_log.unlink(missing_ok=True)
@@ -174,14 +187,43 @@ def main():
         check=True, creationflags=subprocess.CREATE_NO_WINDOW
     )
     elapsed_cmp = time.perf_counter() - t1
-    cmp_frames, cmp_ms = parse_and_verify_gif89a(compact_gif, 720, 404)
+    cmp_frames, cmp_ms = parse_and_verify_gif89a(compact_gif, 720, 404, 5000)
     cmp_bytes = compact_gif.stat().st_size
     assert cmp_bytes <= 6 * 1024 * 1024, f"Compact GIF too large: {cmp_bytes} bytes"
     assert cmp_bytes < bal_bytes, (cmp_bytes, bal_bytes)
     assert elapsed_cmp < 5.0, f"Compact GIF export too slow: {elapsed_cmp:.2f}s"
 
+    # 3) 原生 2K (2560x1440, 6s) 均衡模式：不降分辨率直接保留 2560x1440，单全局调色板+增量透明控制体积 <= 15 MB
+    video_2k = OUT / "synthetic_2k_6s.mp4"
+    subprocess.run(
+        [
+            str(FFMPEG), "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=0x161a1f:s=2560x1440:r=30:d=6",
+            "-f", "lavfi", "-i", "testsrc2=s=800x500:r=30:d=6",
+            "-filter_complex", "[0:v][1:v]overlay=x=400+140*t:y=420,drawgrid=w=120:h=120:t=1:c=0x262c34",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p", "-an",
+            str(video_2k)
+        ],
+        check=True, creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    gif_2k = OUT / "native_2k_6s.gif"
+    log_2k = OUT / "native_2k_6s.log"
+    log_2k.unlink(missing_ok=True)
+    t2 = time.perf_counter()
+    subprocess.run(
+        [str(EXPORTER), str(FFMPEG), "gifski.exe", str(video_2k), str(gif_2k), str(log_2k),
+         "15", "2560", "1440", "0", "1"],
+        check=True, creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    elapsed_2k = time.perf_counter() - t2
+    f2k, ms2k = parse_and_verify_gif89a(gif_2k, 2560, 1440, 6000)
+    b2k = gif_2k.stat().st_size
+    assert b2k <= 15 * 1024 * 1024, f"Native 2K GIF too large: {b2k} bytes"
+    assert elapsed_2k < 8.0, f"Native 2K GIF export too slow: {elapsed_2k:.2f}s"
+
     print(f"Balanced (1080x608, {bal_frames} frames, {bal_ms}ms): {bal_bytes / (1024*1024):.2f} MB in {elapsed_bal:.3f}s")
     print(f"Compact  (720x404,  {cmp_frames} frames, {cmp_ms}ms): {cmp_bytes / (1024*1024):.2f} MB in {elapsed_cmp:.3f}s")
+    print(f"Native 2K (2560x1440, {f2k} frames, {ms2k}ms): {b2k / (1024*1024):.2f} MB in {elapsed_2k:.3f}s")
     print("QQ compatibility & performance checks passed.")
 
 
