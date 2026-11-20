@@ -303,7 +303,7 @@ bool setAutoStart(bool enabled){HKEY key=nullptr;if(RegCreateKeyExW(HKEY_CURRENT
 void settingsLabels(){
     if(!settingsWindow)return;for(int i=0;i<3;++i){const wchar_t* labels[]={L"截图  ",L"贴图  ",L"录屏  "};bool available=i==0?captureHotkey:i==1?pinHotkey:recordHotkey;setLabel(GetDlgItem(settingsWindow,KeyCapture+i),(labels[i]+(waitingHotkey==i+1?L"请按新的快捷键…":keyLabel(i)+(available?L"":L"（占用）"))).c_str());}
     setLabel(GetDlgItem(settingsWindow,FpsToggle),(L"GIF 帧率   "+std::to_wstring(gifFps)+L" 帧/秒").c_str());
-    const wchar_t* qLabel=gifQuality==0?L"GIF 画质   小体积 (≤800px)":gifQuality==1?L"GIF 画质   均衡 (≤1280px)":L"GIF 画质   原尺寸";
+    const wchar_t* qLabel=gifQuality==0?L"GIF 画质   小体积 (≤6MB)":gifQuality==1?L"GIF 画质   均衡 (≤12MB)":L"GIF 画质   高清 (≤25MB)";
     setLabel(GetDlgItem(settingsWindow,GifQualityToggle),qLabel);
     setLabel(GetDlgItem(settingsWindow,ClickEffectToggle),showClickEffect?L"鼠标点击显示   已开启":L"鼠标点击显示   已关闭");
     setLabel(GetDlgItem(settingsWindow,AutoStart),autoStartEnabled()?L"开机启动   已开启":L"开机启动   已关闭");InvalidateRect(settingsWindow,nullptr,FALSE);
@@ -364,7 +364,7 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:{PAINTSTRUCT paint;BeginPaint(hwnd,&paint);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(mainScale,mainScale));rt->Clear(rgb(BG));
         // 统一使用嵌入的高清 Logo，图标资源包含 16 到 256 像素尺寸。
         if(!logo)logo=bitmapFor(rt,brandImage,true);if(logo)rt->DrawBitmap(logo,D2D1::RectF(20,17,70,67),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.6",{83,50,240,69},10,MUTED);
+        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.7",{83,50,240,69},10,MUTED);
         text(rt,L"截图、标注、贴图。",{24,87,320,116},19,INK);
         text(rt,L"录下操作，一键复制 GIF。",{24,118,320,148},14,MUTED);
         auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,166,320,167},0x2C333C);text(rt,notice.empty()?L"GIF 已导出":notice,{24,180,320,208},12,ACCENT);}

@@ -13,7 +13,7 @@ int wmain(int count,wchar_t** args){
     if(count!=9&&count!=11)return 2;
     int fps=_wtoi(args[6]),width=_wtoi(args[7]),height=_wtoi(args[8]);
     int maxWidth=count==11?_wtoi(args[9]):0;
-    int qualityMode=count==11?_wtoi(args[10]):2;
+    int qualityMode=count==11?_wtoi(args[10]):3;
     if(fps<1||fps>50||width<1||height<1||width>65535||height>65535)return 2;
     unsigned hw=std::clamp(std::thread::hardware_concurrency(),2u,8u);
     SetEnvironmentVariableW(L"RAYON_NUM_THREADS",std::to_wstring(hw).c_str());

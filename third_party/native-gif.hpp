@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // 高速、低体积、QQ/微信全平台兼容的 GIF89a 编码器：
-// 单一全局调色板 + 全画幅不透明帧（无局部调色板、无透明增量帧、无残影），支持多线程量化与 LZW 压缩。
+// 单一全局调色板 + 全画幅不透明帧（无局部调色板、无透明增量帧、无残影），支持有损 LZW 与自适应体积控制。
 #pragma once
 #include <algorithm>
 #include <array>
@@ -19,7 +19,7 @@
 
 namespace native_gif_detail {
 
-// SSE2 帧间相似判定：tol == 0 为逐字节精确相等；tol > 0 允许极小噪声容差，但任意单像素超出容差立即判定变化（保留小光标/点击特效）。
+// SSE2 帧间相似判定：tol == 0 为逐字节精确相等；tol > 0 忽略 H.264 编码轻微抖动，但任一高对比像素变化（如鼠标/波纹）立即触发新帧。
 inline bool framesSimilar(const BYTE* a, const BYTE* b, size_t bytes, int tol) {
     size_t n = 0;
     if (tol <= 0) {
@@ -32,18 +32,38 @@ inline bool framesSimilar(const BYTE* a, const BYTE* b, size_t bytes, int tol) {
         for (; n < bytes; ++n) if (a[n] != b[n]) return false;
         return true;
     }
+
     const __m128i tv = _mm_set1_epi8(char(std::min(tol, 127)));
     const __m128i zero = _mm_setzero_si128();
+    int jitterPixels = 0;
+
     for (; n + 16 <= bytes; n += 16) {
         __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + n));
         __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + n));
         __m128i diff = _mm_or_si128(_mm_subs_epu8(va, vb), _mm_subs_epu8(vb, va));
-        if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(diff, tv), zero)) != 0xFFFF)
-            return false;
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(diff, tv), zero)) == 0xFFFF) {
+            continue;
+        }
+        for (int p = 0; p < 4; ++p) {
+            size_t o = n + size_t(p) * 4;
+            int d0 = std::abs(int(a[o + 0]) - int(b[o + 0]));
+            int d1 = std::abs(int(a[o + 1]) - int(b[o + 1]));
+            int d2 = std::abs(int(a[o + 2]) - int(b[o + 2]));
+            int md = std::max({d0, d1, d2});
+            if (md > 24) return false;
+            if (md > tol) {
+                ++jitterPixels;
+                if (jitterPixels >= 24) return false;
+            }
+        }
     }
-    for (; n < bytes; ++n) {
-        int d = int(a[n]) - int(b[n]);
-        if (d < -tol || d > tol) return false;
+    for (; n + 4 <= bytes; n += 4) {
+        int d0 = std::abs(int(a[n + 0]) - int(b[n + 0]));
+        int d1 = std::abs(int(a[n + 1]) - int(b[n + 1]));
+        int d2 = std::abs(int(a[n + 2]) - int(b[n + 2]));
+        int md = std::max({d0, d1, d2});
+        if (md > 24) return false;
+        if (md > tol && ++jitterPixels >= 24) return false;
     }
     return true;
 }
@@ -264,7 +284,7 @@ inline uint8_t nearestColor(int r, int g, int b, const std::vector<Rgb>& palette
 
 struct PaletteMapper {
     std::vector<Rgb> palette;
-    std::vector<std::atomic<uint16_t>> lut18; // 64*64*64 = 262144; 0xFFFF=未计算, 0xFFFE=18位精确冲突
+    std::vector<std::atomic<uint16_t>> lut18;
     bool exactMode = false;
 
     PaletteMapper() : lut18(262144) {
@@ -297,7 +317,39 @@ struct PaletteMapper {
     }
 };
 
-// 高速 GIF89a LZW 压缩器（每线程独立字典，支持 16384 槽位 O(1) 代际清空）。
+// 邻近调色板缓存表：为有损 LZW 提供视觉最接近的候选替代色，显著拉长字典匹配链。
+struct NearPaletteTable {
+    static constexpr int MAX_NEAR = 6;
+    uint8_t nearIdx[256][MAX_NEAR]{};
+    uint16_t nearDist[256][MAX_NEAR]{};
+    uint8_t nearCount[256]{};
+
+    void build(const std::vector<Rgb>& pal, int maxSubDistSq) {
+        std::memset(nearCount, 0, sizeof(nearCount));
+        if (maxSubDistSq <= 0 || pal.size() <= 1) return;
+        for (size_t i = 0; i < pal.size(); ++i) {
+            std::vector<std::pair<int, uint8_t>> cand;
+            cand.reserve(pal.size());
+            for (size_t j = 0; j < pal.size(); ++j) {
+                if (i == j) continue;
+                int dr = int(pal[i].r) - int(pal[j].r);
+                int dg = int(pal[i].g) - int(pal[j].g);
+                int db = int(pal[i].b) - int(pal[j].b);
+                int d2 = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+                if (d2 <= maxSubDistSq) cand.push_back({d2, uint8_t(j)});
+            }
+            std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            uint8_t n = uint8_t(std::min<size_t>(cand.size(), MAX_NEAR));
+            nearCount[i] = n;
+            for (uint8_t k = 0; k < n; ++k) {
+                nearDist[i][k] = uint16_t(cand[k].first);
+                nearIdx[i][k] = cand[k].second;
+            }
+        }
+    }
+};
+
+// 高速 GIF89a LZW 压缩器（支持无损及可控有损字典匹配，输出 100% 标准兼容的 GIF89a 码流）。
 struct LzwEncoder {
     static constexpr uint32_t HASH_SIZE = 16384;
     static constexpr uint32_t HASH_MASK = HASH_SIZE - 1;
@@ -308,7 +360,10 @@ struct LzwEncoder {
 
     LzwEncoder() : keys(HASH_SIZE, 0), vals(HASH_SIZE, 0), gens(HASH_SIZE, 0) {}
 
-    std::vector<uint8_t> compress(const uint8_t* pixels, size_t count, int minCodeSize) {
+    std::vector<uint8_t> compress(
+        const uint8_t* pixels, size_t count, int minCodeSize,
+        int lossyLevel = 0, const NearPaletteTable* nearTable = nullptr
+    ) {
         std::vector<uint8_t> out;
         out.reserve(std::max<size_t>(64, count / 4));
         out.push_back(uint8_t(minCodeSize));
@@ -355,13 +410,14 @@ struct LzwEncoder {
         emitCode(clearCode, codeSize);
         if (count == 0) {
             emitCode(eoiCode, codeSize);
-            if (bitCount > 0) {
-                sub[subLen++] = uint8_t(accum & 0xFFu);
-            }
+            if (bitCount > 0) sub[subLen++] = uint8_t(accum & 0xFFu);
             flushSub();
             out.push_back(0);
             return out;
         }
+
+        const int maxRunErr = (lossyLevel == 1) ? 900 : (lossyLevel == 2) ? 2200 : (lossyLevel >= 3) ? 4800 : 0;
+        int runErr = 0;
 
         uint32_t prefix = pixels[0];
         for (size_t i = 1; i < count; ++i) {
@@ -377,8 +433,29 @@ struct LzwEncoder {
                 }
                 slot = (slot + 1u) & HASH_MASK;
             }
+            if (!found && lossyLevel > 0 && nearTable && runErr < maxRunErr) {
+                uint8_t nc = nearTable->nearCount[k];
+                for (uint8_t j = 0; j < nc; ++j) {
+                    int d2 = int(nearTable->nearDist[k][j]);
+                    if (runErr + d2 > maxRunErr) break;
+                    uint8_t alt = nearTable->nearIdx[k][j];
+                    uint32_t aKey = (prefix << 8) | alt;
+                    uint32_t aSlot = ((aKey * 2654435761u) >> 18) & HASH_MASK;
+                    while (gens[aSlot] == gen) {
+                        if (keys[aSlot] == aKey) {
+                            prefix = vals[aSlot];
+                            runErr += d2;
+                            found = true;
+                            break;
+                        }
+                        aSlot = (aSlot + 1u) & HASH_MASK;
+                    }
+                    if (found) break;
+                }
+            }
             if (!found) {
                 emitCode(prefix, codeSize);
+                runErr = 0;
                 if (nextCode < 4096u) {
                     if (nextCode == (1u << codeSize) && codeSize < 12) {
                         ++codeSize;
@@ -397,9 +474,7 @@ struct LzwEncoder {
 
         emitCode(prefix, codeSize);
         emitCode(eoiCode, codeSize);
-        if (bitCount > 0) {
-            sub[subLen++] = uint8_t(accum & 0xFFu);
-        }
+        if (bitCount > 0) sub[subLen++] = uint8_t(accum & 0xFFu);
         flushSub();
         out.push_back(0);
         return out;
@@ -433,7 +508,6 @@ inline void writeGifHeader(std::ofstream& out, int w, int h, const std::vector<R
     }
     out.write(reinterpret_cast<const char*>(gct.data()), gct.size());
 
-    // Netscape 2.0 无限循环扩展。
     static constexpr uint8_t netscape[19] = {
         0x21, 0xFF, 0x0B,
         'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0',
@@ -443,13 +517,12 @@ inline void writeGifHeader(std::ofstream& out, int w, int h, const std::vector<R
 }
 
 inline void writeGifFrame(std::ofstream& out, int w, int h, unsigned totalDelayCs, const std::vector<uint8_t>& lzwData) {
-    // 若单帧总延时超过 65535 厘秒，拆分为多帧避免 16 位溢出。
     unsigned remaining = std::max(1u, totalDelayCs);
     while (remaining > 0) {
         unsigned d = std::min(remaining, 65535u);
         uint8_t gce[8] = {
             0x21, 0xF9, 0x04,
-            0x04, // Disposal = 1 (保留当前全画幅)，TransparencyFlag = 0 (无透明像素，杜绝 QQ 拖影)
+            0x04, // Disposal = 1 (保留全画幅), TransparencyFlag = 0 (彻底杜绝 QQ 群聊拖影)
             uint8_t(d & 0xFFu), uint8_t((d >> 8) & 0xFFu),
             0x00, 0x00
         };
@@ -469,17 +542,12 @@ inline void writeGifFrame(std::ofstream& out, int w, int h, unsigned totalDelayC
 
 inline void mapFrameRowRange(
     const uint8_t* currRgb, uint8_t* stabRgb, uint8_t* prevIdx, uint8_t* outIdx,
-    int outW, int y0, int y1, PaletteMapper& mapper, int ditherAmp, int stabTol, bool firstFrame
+    int outW, int y0, int y1, PaletteMapper& mapper, int snapDistSq, int stabTol, bool firstFrame
 ) {
-    static constexpr int BAYER4[4][4] = {
-        {-15,  1, -11,  5},
-        {  9, -7,  13, -3},
-        { -9,  7, -13,  3},
-        { 15, -1,  11, -5}
-    };
     for (int y = y0; y < y1; ++y) {
         size_t rowBase = size_t(y) * outW;
-        const int* bayerRow = BAYER4[y & 3];
+        uint8_t rowPrevIdx = 0;
+        bool hasRowPrev = false;
         for (int x = 0; x < outW; ++x) {
             size_t p = rowBase + size_t(x);
             size_t o = p * 3;
@@ -493,21 +561,33 @@ inline void mapFrameRowRange(
                 if (dr >= -stabTol && dr <= stabTol &&
                     dg >= -stabTol && dg <= stabTol &&
                     db >= -stabTol && db <= stabTol) {
-                    outIdx[p] = prevIdx[p];
+                    uint8_t idx = prevIdx[p];
+                    outIdx[p] = idx;
+                    rowPrevIdx = idx;
+                    hasRowPrev = true;
                     continue;
                 }
             }
-            int rr = r, gg = g, bb = b;
-            if (ditherAmp > 0) {
-                int d = (bayerRow[x & 3] * ditherAmp) >> 4;
-                rr = std::clamp(rr + d, 0, 255);
-                gg = std::clamp(gg + d, 0, 255);
-                bb = std::clamp(bb + d, 0, 255);
+            uint8_t best = mapper.mapPixel(r, g, b);
+            uint8_t chosen = best;
+            if (snapDistSq > 0 && hasRowPrev && rowPrevIdx != best) {
+                const Rgb& pr = mapper.palette[rowPrevIdx];
+                int drp = int(r) - int(pr.r), dgp = int(g) - int(pr.g), dbp = int(b) - int(pr.b);
+                int dPrev = 2 * drp * drp + 4 * dgp * dgp + 3 * dbp * dbp;
+                if (dPrev <= snapDistSq) {
+                    const Rgb& br = mapper.palette[best];
+                    int drb = int(r) - int(br.r), dgb = int(g) - int(br.g), dbb = int(b) - int(br.b);
+                    int dBest = 2 * drb * drb + 4 * dgb * dgb + 3 * dbb * dbb;
+                    if (dPrev <= dBest + snapDistSq) {
+                        chosen = rowPrevIdx;
+                    }
+                }
             }
-            uint8_t idx = mapper.mapPixel(rr, gg, bb);
-            outIdx[p] = idx;
+            outIdx[p] = chosen;
+            rowPrevIdx = chosen;
+            hasRowPrev = true;
             if (stabTol > 0) {
-                prevIdx[p] = idx;
+                prevIdx[p] = chosen;
                 stabRgb[o + 0] = r;
                 stabRgb[o + 1] = g;
                 stabRgb[o + 2] = b;
@@ -516,54 +596,65 @@ inline void mapFrameRowRange(
     }
 }
 
-} // namespace native_gif_detail
+struct GifParams {
+    int effFps;
+    int effMaxWidth;
+    int maxColors;
+    int dedupeTol;
+    int stabTol;
+    int lossyLevel;
+    uint64_t targetMaxBytes;
+    int qualityMode;
+};
 
-// qualityMode: 0=小体积(默认最长边800,96色), 1=均衡(默认最长边1280,128色), 2=原尺寸高保真(不缩放,256色,无损容差)
-inline bool encodeNativeGif(
-    const std::wstring& tool, const std::wstring& video, const std::wstring& gif, const std::wstring& log,
-    int fps, int width, int height, int maxWidth = 0, int qualityMode = 2
+struct AttemptOutcome {
+    bool ok = false;
+    bool needsRetry = false;
+    int outW = 0;
+    int outH = 0;
+    unsigned readFrames = 0;
+    size_t framesWritten = 0;
+    size_t colors = 0;
+    uint64_t fileBytes = 0;
+    uint64_t estBytes = 0;
+    ULONGLONG readMs = 0;
+    ULONGLONG quantMs = 0;
+    ULONGLONG encodeMs = 0;
+    bool streaming = false;
+};
+
+inline AttemptOutcome encodeNativeGifAttempt(
+    const std::wstring& tool, const std::wstring& video, const std::wstring& gif,
+    int srcW, int srcH, const GifParams& cfg, bool allowProbeAbort
 ) {
-    using namespace native_gif_detail;
-    ULONGLONG began = GetTickCount64(), readMs = 0, quantMs = 0, encodeMs = 0;
-
+    AttemptOutcome res;
     NativeVideo decoder(video);
-    if (decoder.error < 0) return false;
-    if (width <= 0 || height <= 0) {
-        width = decoder.sourceWidth();
-        height = decoder.sourceHeight();
-    }
-    if (width < 2 || height < 2) return false;
+    if (decoder.error < 0) return res;
 
-    int effMaxWidth = maxWidth;
-    int maxColors = 256, dedupeTol = 0, stabTol = 0, ditherAmp = 0;
-    if (qualityMode == 0) {
-        if (effMaxWidth <= 0) effMaxWidth = 800;
-        maxColors = 96; dedupeTol = 4; stabTol = 5; ditherAmp = 8;
-    } else if (qualityMode == 1) {
-        if (effMaxWidth <= 0) effMaxWidth = 1280;
-        maxColors = 128; dedupeTol = 3; stabTol = 4; ditherAmp = 6;
-    }
-
-    int outW = width, outH = height;
-    if (effMaxWidth > 0 && std::max(width, height) > effMaxWidth) {
-        if (width >= height) {
-            outW = effMaxWidth & ~1;
-            outH = std::max(2, int(std::llround(double(height) * outW / width)) & ~1);
+    int outW = srcW, outH = srcH;
+    if (cfg.effMaxWidth > 0 && std::max(srcW, srcH) > cfg.effMaxWidth) {
+        if (srcW >= srcH) {
+            outW = std::max(2, cfg.effMaxWidth & ~1);
+            outH = std::max(2, int(std::llround(double(srcH) * outW / srcW)) & ~1);
         } else {
-            outH = effMaxWidth & ~1;
-            outW = std::max(2, int(std::llround(double(width) * outH / height)) & ~1);
+            outH = std::max(2, cfg.effMaxWidth & ~1);
+            outW = std::max(2, int(std::llround(double(srcW) * outH / srcH)) & ~1);
         }
     }
     outW = std::clamp(outW, 2, 65535);
     outH = std::clamp(outH, 2, 65535);
+    res.outW = outW;
+    res.outH = outH;
 
+    const int fps = std::clamp(cfg.effFps, 1, 50);
     const size_t pixelCount = size_t(outW) * size_t(outH);
     const size_t rgbaBytes = pixelCount * 4;
     const size_t rgbBytes = pixelCount * 3;
-    const size_t maxRamCacheBytes = 256ull * 1024 * 1024;
+    const size_t maxRamCacheBytes = 512ull * 1024 * 1024;
 
     std::vector<BYTE> current(rgbaBytes), previous(rgbaBytes);
     std::vector<std::vector<uint8_t>> cachedRgb;
+    std::vector<std::vector<uint8_t>> probeFallbackRgb; // 流式超限时的 6 帧探针缓存
     size_t cachedBytes = 0;
     bool streamingPass2 = false;
 
@@ -587,7 +678,7 @@ inline bool encodeNativeGif(
             for (size_t i = 0; i < pixelCount; ++i) {
                 uint32_t c = pCurr[i] & 0x00FFFFFFu;
                 uniqueColors.insert(c);
-                if (uniqueColors.size() > size_t(maxColors)) {
+                if (uniqueColors.size() > size_t(cfg.maxColors)) {
                     tooManyUnique = true;
                     break;
                 }
@@ -595,9 +686,7 @@ inline bool encodeNativeGif(
         }
         size_t uniformBudget = hasPrev ? 4096 : 16384;
         size_t step = std::max<size_t>(1, pixelCount / uniformBudget);
-        for (size_t i = 0; i < pixelCount; i += step) {
-            samples.push_back(pCurr[i]);
-        }
+        for (size_t i = 0; i < pixelCount; i += step) samples.push_back(pCurr[i]);
         if (hasPrev) {
             size_t changedBudget = 4096;
             size_t cStep = std::max<size_t>(1, pixelCount / 16384);
@@ -611,10 +700,32 @@ inline bool encodeNativeGif(
         }
         if (samples.size() > MAX_SAMPLES) {
             size_t write = 0;
-            for (size_t read = 0; read < samples.size(); read += 2) {
-                samples[write++] = samples[read];
-            }
+            for (size_t read = 0; read < samples.size(); read += 2) samples[write++] = samples[read];
             samples.resize(write);
+        }
+    };
+
+    auto storeKeptFrame = [&](const BYTE* rgba) {
+        if (!streamingPass2 && cachedBytes + rgbBytes <= maxRamCacheBytes) {
+            std::vector<uint8_t> rgb(rgbBytes);
+            packRgbaToRgb24(rgba, rgb.data(), pixelCount);
+            cachedRgb.push_back(std::move(rgb));
+            cachedBytes += rgbBytes;
+        } else {
+            if (!streamingPass2) {
+                streamingPass2 = true;
+                for (size_t i = 0; i < 6 && i < cachedRgb.size(); ++i) {
+                    size_t pick = (i * cachedRgb.size()) / std::min<size_t>(6, cachedRgb.size());
+                    probeFallbackRgb.push_back(std::move(cachedRgb[pick]));
+                }
+                std::vector<std::vector<uint8_t>>().swap(cachedRgb);
+                cachedBytes = 0;
+            }
+            if (probeFallbackRgb.size() < 6) {
+                std::vector<uint8_t> rgb(rgbBytes);
+                packRgbaToRgb24(rgba, rgb.data(), pixelCount);
+                probeFallbackRgb.push_back(std::move(rgb));
+            }
         }
     };
 
@@ -632,54 +743,40 @@ inline bool encodeNativeGif(
             decodeOk = false;
             break;
         }
-        readMs += GetTickCount64() - step;
+        res.readMs += GetTickCount64() - step;
 
         if (!hasPending) {
             previous.swap(current);
             pending = index;
             hasPending = true;
             addFrameSamples(previous.data(), nullptr, false);
-            if (!streamingPass2 && cachedBytes + rgbBytes <= maxRamCacheBytes) {
-                std::vector<uint8_t> rgb(rgbBytes);
-                packRgbaToRgb24(previous.data(), rgb.data(), pixelCount);
-                cachedRgb.push_back(std::move(rgb));
-                cachedBytes += rgbBytes;
-            } else {
-                streamingPass2 = true;
-                std::vector<std::vector<uint8_t>>().swap(cachedRgb);
-                cachedBytes = 0;
-            }
-        } else if (!framesSimilar(current.data(), previous.data(), rgbaBytes, dedupeTol)) {
+            storeKeptFrame(previous.data());
+        } else if (!framesSimilar(current.data(), previous.data(), rgbaBytes, cfg.dedupeTol)) {
             unsigned dur = unsigned((uint64_t(index) * 100 + fps / 2) / fps - (uint64_t(pending) * 100 + fps / 2) / fps);
             kept.push_back({pending, index, std::max(1u, dur)});
             addFrameSamples(current.data(), previous.data(), true);
             previous.swap(current);
             pending = index;
-            if (!streamingPass2 && cachedBytes + rgbBytes <= maxRamCacheBytes) {
-                std::vector<uint8_t> rgb(rgbBytes);
-                packRgbaToRgb24(previous.data(), rgb.data(), pixelCount);
-                cachedRgb.push_back(std::move(rgb));
-                cachedBytes += rgbBytes;
-            } else {
-                streamingPass2 = true;
-                std::vector<std::vector<uint8_t>>().swap(cachedRgb);
-                cachedBytes = 0;
-            }
+            storeKeptFrame(previous.data());
         }
         readFrames = index + 1;
     }
 
     if (!decodeOk || decoder.error < 0 || !hasPending || readFrames == 0) {
-        return false;
+        return res;
     }
     unsigned lastEndIdx = std::max(readFrames, decoder.endIndex(fps));
     unsigned lastDur = unsigned((uint64_t(lastEndIdx) * 100 + fps / 2) / fps - (uint64_t(pending) * 100 + fps / 2) / fps);
     kept.push_back({pending, lastEndIdx, std::max(1u, lastDur)});
 
-    // 全局调色板生成（全程仅执行一次）。
+    res.readFrames = readFrames;
+    res.framesWritten = kept.size();
+    res.streaming = streamingPass2;
+
+    // 全局调色板生成（仅执行一次）。
     ULONGLONG qStart = GetTickCount64();
     std::vector<Rgb> palette;
-    bool exactPalette = !tooManyUnique && !uniqueColors.empty() && uniqueColors.size() <= size_t(maxColors);
+    bool exactPalette = !tooManyUnique && !uniqueColors.empty() && uniqueColors.size() <= size_t(cfg.maxColors);
 
     if (exactPalette) {
         palette.reserve(uniqueColors.size());
@@ -688,7 +785,7 @@ inline bool encodeNativeGif(
         }
     } else {
         bool usedGifski = false;
-        if (maxColors >= 255 && !samples.empty()) {
+        if (cfg.maxColors >= 255 && !samples.empty()) {
             using Quantize = int(*)(const void*, size_t, BYTE*, UINT*);
             size_t slash = tool.find_last_of(L"\\/");
             std::wstring dllPath = (slash == std::wstring::npos ? L"" : tool.substr(0, slash) + L"\\") + L"gifski.dll";
@@ -713,31 +810,69 @@ inline bool encodeNativeGif(
         if (!usedGifski) {
             WuQuantizer wu;
             wu.addSamples(samples.data(), samples.size());
-            palette = wu.quantize(maxColors);
+            palette = wu.quantize(cfg.maxColors);
         }
     }
 
     int gctBits = 2;
     while ((1 << gctBits) < int(palette.size()) && gctBits < 8) ++gctBits;
     const int minCodeSize = gctBits;
+    res.colors = palette.size();
 
     PaletteMapper mapper;
     mapper.init(palette, exactPalette);
-    quantMs = GetTickCount64() - qStart;
 
-    // 打开输出 GIF 文件并写入头信息与全局调色板。
+    const int snapDistSq = (cfg.lossyLevel == 1) ? 120 : (cfg.lossyLevel == 2) ? 260 : (cfg.lossyLevel >= 3) ? 480 : 0;
+    const int maxSubDistSq = (cfg.lossyLevel == 1) ? 450 : (cfg.lossyLevel == 2) ? 1100 : (cfg.lossyLevel >= 3) ? 2400 : 0;
+    NearPaletteTable nearTable;
+    if (cfg.lossyLevel > 0 && !exactPalette) {
+        nearTable.build(mapper.palette, maxSubDistSq);
+    }
+    res.quantMs = GetTickCount64() - qStart;
+
+    const size_t totalFrames = kept.size();
+
+    // 6 帧快速体积探针：在完整编码前预估总体积，超限则提前重采样而无需浪费编码时间。
+    if (allowProbeAbort && cfg.targetMaxBytes > 0 && totalFrames > 6) {
+        std::vector<const uint8_t*> probePtrs;
+        if (!streamingPass2 && !cachedRgb.empty()) {
+            size_t cnt = std::min<size_t>(6, cachedRgb.size());
+            for (size_t i = 0; i < cnt; ++i) {
+                size_t pick = (i * (cachedRgb.size() - 1)) / std::max<size_t>(1, cnt - 1);
+                probePtrs.push_back(cachedRgb[pick].data());
+            }
+        } else if (!probeFallbackRgb.empty()) {
+            for (const auto& fr : probeFallbackRgb) probePtrs.push_back(fr.data());
+        }
+        if (!probePtrs.empty()) {
+            uint64_t probeBytesSum = 0;
+            std::vector<uint8_t> tmpIdx(pixelCount);
+            LzwEncoder probeLzw;
+            for (const uint8_t* rgbPtr : probePtrs) {
+                mapFrameRowRange(rgbPtr, nullptr, nullptr, tmpIdx.data(), outW, 0, outH, mapper, snapDistSq, 0, true);
+                auto lzwOut = probeLzw.compress(tmpIdx.data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
+                probeBytesSum += uint64_t(18 + lzwOut.size());
+            }
+            uint64_t est = uint64_t((double(probeBytesSum) / double(probePtrs.size())) * double(totalFrames)) + 2048;
+            res.estBytes = est;
+            if (est > cfg.targetMaxBytes) {
+                res.needsRetry = true;
+                return res;
+            }
+        }
+    }
+    std::vector<std::vector<uint8_t>>().swap(probeFallbackRgb);
+
     ULONGLONG eStart = GetTickCount64();
     std::ofstream gifOut(gif.c_str(), std::ios::binary);
-    if (!gifOut) return false;
+    if (!gifOut) return res;
     writeGifHeader(gifOut, outW, outH, palette, gctBits);
 
     const unsigned numThreads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
-    const size_t totalFrames = kept.size();
 
     if (!streamingPass2 && cachedRgb.size() == totalFrames) {
-        // 全内存模式：先并行切片做色彩映射与时域稳定，再并行进行 LZW 压缩。
         std::vector<std::vector<uint8_t>> indexedFrames(totalFrames, std::vector<uint8_t>(pixelCount));
-        if (stabTol > 0) {
+        if (cfg.stabTol > 0) {
             unsigned sliceThreads = std::min<unsigned>(numThreads, std::max<unsigned>(1, unsigned(outH / 16)));
             std::vector<std::thread> workers;
             for (unsigned t = 0; t < sliceThreads; ++t) {
@@ -750,19 +885,17 @@ inline bool encodeNativeGif(
                     size_t sliceOffsetBytes = size_t(y0) * outW * 3;
                     size_t sliceOffsetPx = size_t(y0) * outW;
                     for (size_t f = 0; f < totalFrames; ++f) {
-                        // 复用 mapFrameRowRange 逻辑在切片缓冲上运行。
-                        const uint8_t* srcSlice = cachedRgb[f].data() + sliceOffsetBytes;
-                        uint8_t* dstSlice = indexedFrames[f].data() + sliceOffsetPx;
                         mapFrameRowRange(
-                            srcSlice, sliceStab.data(), slicePrevIdx.data(), dstSlice,
-                            outW, 0, y1 - y0, mapper, ditherAmp, stabTol, f == 0
+                            cachedRgb[f].data() + sliceOffsetBytes,
+                            sliceStab.data(), slicePrevIdx.data(),
+                            indexedFrames[f].data() + sliceOffsetPx,
+                            outW, 0, y1 - y0, mapper, snapDistSq, cfg.stabTol, f == 0
                         );
                     }
                 });
             }
             for (auto& w : workers) w.join();
         } else {
-            // stabTol == 0：帧间完全独立，多线程并行映射所有帧。
             std::atomic<size_t> nextFrame{0};
             unsigned mapThreads = std::min<unsigned>(numThreads, unsigned(totalFrames));
             std::vector<std::thread> workers;
@@ -773,7 +906,7 @@ inline bool encodeNativeGif(
                         if (f >= totalFrames) break;
                         mapFrameRowRange(
                             cachedRgb[f].data(), nullptr, nullptr, indexedFrames[f].data(),
-                            outW, 0, outH, mapper, ditherAmp, 0, true
+                            outW, 0, outH, mapper, snapDistSq, 0, true
                         );
                     }
                 });
@@ -792,7 +925,7 @@ inline bool encodeNativeGif(
                 for (;;) {
                     size_t f = nextLzw.fetch_add(1, std::memory_order_relaxed);
                     if (f >= totalFrames) break;
-                    lzwFrames[f] = lzw.compress(indexedFrames[f].data(), pixelCount, minCodeSize);
+                    lzwFrames[f] = lzw.compress(indexedFrames[f].data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
                 }
             });
         }
@@ -802,11 +935,10 @@ inline bool encodeNativeGif(
             writeGifFrame(gifOut, outW, outH, kept[f].delayCs, lzwFrames[f]);
         }
     } else {
-        // 大视频流式模式：分批重新解码并在有界内存中并行 LZW 写出。
         NativeVideo decoder2(video);
-        if (decoder2.error < 0) return false;
-        std::vector<uint8_t> stabRgb(stabTol > 0 ? rgbBytes : 0, 0);
-        std::vector<uint8_t> prevIdx(stabTol > 0 ? pixelCount : 0, 0);
+        if (decoder2.error < 0) return res;
+        std::vector<uint8_t> stabRgb(cfg.stabTol > 0 ? rgbBytes : 0, 0);
+        std::vector<uint8_t> prevIdx(cfg.stabTol > 0 ? pixelCount : 0, 0);
 
         size_t batchCap = std::max<size_t>(1, std::min<size_t>(numThreads * 2, (128ull * 1024 * 1024) / std::max<size_t>(1, pixelCount + rgbBytes)));
         std::vector<std::vector<uint8_t>> batchIndexed;
@@ -826,7 +958,7 @@ inline bool encodeNativeGif(
                     for (;;) {
                         size_t idx = nextItem.fetch_add(1, std::memory_order_relaxed);
                         if (idx >= batchIndexed.size()) break;
-                        batchLzw[idx] = lzw.compress(batchIndexed[idx].data(), pixelCount, minCodeSize);
+                        batchLzw[idx] = lzw.compress(batchIndexed[idx].data(), pixelCount, minCodeSize, cfg.lossyLevel, &nearTable);
                     }
                 });
             }
@@ -846,15 +978,15 @@ inline bool encodeNativeGif(
             if (read2 && idx < read2) continue;
             read2 = idx + 1;
             if (idx < kept[targetIdx].startSample) continue;
-            if (!decoder2.rgb(current, outW, outH)) return false;
+            if (!decoder2.rgb(current, outW, outH)) return res;
             packRgbaToRgb24(current.data(), tmpRgb.data(), pixelCount);
             std::vector<uint8_t> mapped(pixelCount);
             mapFrameRowRange(
                 tmpRgb.data(),
-                stabTol > 0 ? stabRgb.data() : nullptr,
-                stabTol > 0 ? prevIdx.data() : nullptr,
+                cfg.stabTol > 0 ? stabRgb.data() : nullptr,
+                cfg.stabTol > 0 ? prevIdx.data() : nullptr,
                 mapped.data(),
-                outW, 0, outH, mapper, ditherAmp, stabTol, targetIdx == 0
+                outW, 0, outH, mapper, snapDistSq, cfg.stabTol, targetIdx == 0
             );
             batchIndexed.push_back(std::move(mapped));
             batchDelays.push_back(kept[targetIdx].delayCs);
@@ -862,26 +994,147 @@ inline bool encodeNativeGif(
             if (batchIndexed.size() >= batchCap) flushBatch();
         }
         flushBatch();
-        if (targetIdx != totalFrames) return false;
+        if (targetIdx != totalFrames) return res;
     }
 
     uint8_t trailer = 0x3B;
     gifOut.write(reinterpret_cast<const char*>(&trailer), 1);
     gifOut.flush();
     bool writeOk = gifOut.good();
-    uint64_t fileBytes = uint64_t(gifOut.tellp());
+    res.fileBytes = uint64_t(gifOut.tellp());
     gifOut.close();
-    encodeMs = GetTickCount64() - eStart;
+    res.encodeMs = GetTickCount64() - eStart;
+    res.ok = writeOk && totalFrames > 0;
+    if (res.ok && allowProbeAbort && cfg.targetMaxBytes > 0 && res.fileBytes > uint64_t(double(cfg.targetMaxBytes) * 1.12)) {
+        res.needsRetry = true;
+    }
+    return res;
+}
+
+inline void adaptParamsForBudget(GifParams& cfg, int curW, int curH, size_t curFrames, uint64_t observedBytes) {
+    double ratio = (double(cfg.targetMaxBytes) * 0.78) / double(std::max<uint64_t>(1, observedBytes));
+    int oldMaxDim = std::max(curW, curH);
+    int oldFps = cfg.effFps;
+    int oldLossy = cfg.lossyLevel;
+    int oldColors = cfg.maxColors;
+
+    cfg.lossyLevel = std::min(3, cfg.lossyLevel + 1);
+    double lossyGain = (cfg.lossyLevel > oldLossy) ? 1.28 : 1.0;
+
+    if (cfg.maxColors > 64) cfg.maxColors = 64;
+    else if (ratio < 0.55 && cfg.maxColors > 48) cfg.maxColors = 48;
+    double colorGain = (cfg.maxColors < oldColors) ? 1.10 : 1.0;
+
+    double fpsGain = 1.0;
+    if (curFrames > 32 && ratio < 0.72) {
+        double fpsFactor = std::clamp(std::pow(ratio, 0.28), 0.55, 0.85);
+        int newFps = std::max(8, int(std::floor(double(oldFps) * fpsFactor)));
+        if (newFps < oldFps) {
+            cfg.effFps = newFps;
+            fpsGain = double(oldFps) / double(newFps);
+        }
+    }
+
+    double areaRatio = ratio * lossyGain * colorGain * fpsGain;
+    double dimScale = std::clamp(std::sqrt(areaRatio), 0.28, 0.90);
+    int newMaxW = std::max(360, int(std::lround(double(oldMaxDim) * dimScale)) & ~1);
+    if (newMaxW >= oldMaxDim && cfg.effFps >= oldFps && cfg.lossyLevel <= oldLossy) {
+        newMaxW = std::max(360, int(std::lround(double(oldMaxDim) * 0.78)) & ~1);
+    }
+    cfg.effMaxWidth = newMaxW;
+}
+
+} // namespace native_gif_detail
+
+// qualityMode:
+//   0 = 小体积 (≤6MB), 1 = 均衡 (≤12MB), 2 = 高清 (≤25MB), 3 = 原尺寸精确回归模式（不设上限、不降采样、无损容差）
+inline bool encodeNativeGif(
+    const std::wstring& tool, const std::wstring& video, const std::wstring& gif, const std::wstring& log,
+    int fps, int width, int height, int maxWidth = 0, int qualityMode = 3
+) {
+    using namespace native_gif_detail;
+    ULONGLONG began = GetTickCount64();
+
+    double estDurationSec = 0.0;
+    {
+        NativeVideo probe(video);
+        if (probe.error < 0) return false;
+        if (width <= 0 || height <= 0) {
+            width = probe.sourceWidth();
+            height = probe.sourceHeight();
+        }
+        if (probe.container && probe.container->duration > 0) {
+            estDurationSec = double(probe.container->duration) / double(AV_TIME_BASE);
+        }
+    }
+    if (width < 2 || height < 2) return false;
+
+    GifParams cfg{};
+    cfg.qualityMode = std::clamp(qualityMode, 0, 3);
+    cfg.effFps = std::clamp(fps, 1, 50);
+
+    if (cfg.qualityMode == 0) {
+        cfg.effFps = std::min(cfg.effFps, 12);
+        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 720;
+        cfg.maxColors = 64;
+        cfg.dedupeTol = 6;
+        cfg.stabTol = 6;
+        cfg.lossyLevel = 2;
+        cfg.targetMaxBytes = 6ull * 1024 * 1024;
+    } else if (cfg.qualityMode == 1) {
+        cfg.effFps = std::min(cfg.effFps, 15);
+        cfg.effMaxWidth = maxWidth > 0 ? maxWidth : 1080;
+        cfg.maxColors = 96;
+        cfg.dedupeTol = 5;
+        cfg.stabTol = 5;
+        cfg.lossyLevel = 1;
+        cfg.targetMaxBytes = 12ull * 1024 * 1024;
+    } else if (cfg.qualityMode == 2) {
+        if (estDurationSec > 6.0) cfg.effFps = std::min(cfg.effFps, 20);
+        cfg.effMaxWidth = maxWidth;
+        cfg.maxColors = 128;
+        cfg.dedupeTol = 4;
+        cfg.stabTol = 3;
+        cfg.lossyLevel = 1;
+        cfg.targetMaxBytes = 25ull * 1024 * 1024;
+        // 超高分辨率长视频首轮预缩放，避免首轮扫描耗时过长
+        if (cfg.effMaxWidth == 0 && estDurationSec > 4.0) {
+            double pixelBudget = double(width) * double(height) * double(cfg.effFps) * estDurationSec;
+            if (pixelBudget > 700e6) cfg.effMaxWidth = 1280;
+            else if (pixelBudget > 350e6) cfg.effMaxWidth = 1600;
+        }
+    } else {
+        cfg.effMaxWidth = maxWidth;
+        cfg.maxColors = 256;
+        cfg.dedupeTol = 0;
+        cfg.stabTol = 0;
+        cfg.lossyLevel = 0;
+        cfg.targetMaxBytes = 0;
+    }
+
+    AttemptOutcome outcome;
+    int attempts = 0;
+    const int maxAttempts = cfg.targetMaxBytes > 0 ? 3 : 1;
+    while (attempts < maxAttempts) {
+        bool allowAbort = (attempts + 1 < maxAttempts);
+        outcome = encodeNativeGifAttempt(tool, video, gif, width, height, cfg, allowAbort);
+        ++attempts;
+        if (!outcome.needsRetry || !allowAbort) break;
+        uint64_t observed = outcome.fileBytes > 0 ? outcome.fileBytes : outcome.estBytes;
+        adaptParamsForBudget(cfg, outcome.outW, outcome.outH, outcome.framesWritten, observed);
+    }
 
     std::ofstream stats(log.c_str(), std::ios::app);
-    stats << "\nGIF fast width=" << outW << " height=" << outH
+    stats << "\nGIF fast width=" << outcome.outW << " height=" << outcome.outH
           << " src_w=" << width << " src_h=" << height
-          << " colors=" << palette.size() << " mode=" << qualityMode
-          << " frames_read=" << readFrames << " frames_written=" << totalFrames
-          << " file_bytes=" << fileBytes
+          << " fps=" << cfg.effFps << " colors=" << outcome.colors
+          << " mode=" << cfg.qualityMode << " lossy=" << cfg.lossyLevel
+          << " attempts=" << attempts
+          << " frames_read=" << outcome.readFrames << " frames_written=" << outcome.framesWritten
+          << " file_bytes=" << outcome.fileBytes
           << " elapsed_ms=" << (GetTickCount64() - began)
-          << " read_ms=" << readMs << " quant_ms=" << quantMs << " encode_ms=" << encodeMs
-          << " streaming=" << (streamingPass2 ? 1 : 0) << "\n";
+          << " read_ms=" << outcome.readMs << " quant_ms=" << outcome.quantMs << " encode_ms=" << outcome.encodeMs
+          << " streaming=" << (outcome.streaming ? 1 : 0) << "\n";
 
-    return writeOk && totalFrames > 0;
+    return outcome.ok;
 }

@@ -26,8 +26,8 @@ bool mergeSegments(const std::wstring& ff,const std::vector<std::wstring>& segme
 // 使用独立高速转换器生成全画幅单一全局调色板 GIF（杜绝 QQ 群聊拖影，大幅缩减体积与转换耗时）。
 bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstring& video,const std::wstring& gif,const std::wstring& log,int fps,int width,int height,int gifQuality=1){
     fps=std::clamp(fps,1,50);
-    int mode=std::clamp(gifQuality,0,2);
-    int maxWidth=mode==0?800:mode==1?1280:0;
+    int mode=std::clamp(gifQuality,0,3);
+    int maxWidth=mode==0?720:mode==1?1080:0;
     std::wstring helper=gifski.substr(0,gifski.find_last_of(L"\\/"))+L"\\gifski-export.exe";if(nonempty(helper)){Child process;return launch(process,helper,quote(ff)+L" "+quote(gifski)+L" "+quote(video)+L" "+quote(gif)+L" "+quote(log)+L" "+std::to_wstring(fps)+L" "+std::to_wstring(width)+L" "+std::to_wstring(height)+L" "+std::to_wstring(maxWidth)+L" "+std::to_wstring(mode),log)&&result(process)==0&&nonempty(gif);}
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
     Child encoder,decoder;bool enc=launch(encoder,gifski,L"--quiet --quality 90 --width "+std::to_wstring(width)+L" --height "+std::to_wstring(height)+L" --fps "+std::to_wstring(fps)+L" -o "+quote(gif)+L" -",log,read);CloseHandle(read);

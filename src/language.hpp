@@ -13,7 +13,7 @@ inline std::wstring localize(std::wstring value){
         {L"复制已录 GIF（会暂停）",L"Copy recorded GIF (pauses)"},{L"暂停 / 继续",L"Pause / Resume"},{L"结束录制",L"Finish recording"},
         {L"点击提示：显示中（点击切换）",L"Click indicator: On (toggle)"},{L"点击提示：已隐藏（点击切换）",L"Click indicator: Off (toggle)"},
         {L"鼠标点击显示   已开启",L"Click indicator   On"},{L"鼠标点击显示   已关闭",L"Click indicator   Off"},{L"鼠标点击显示",L"Click indicator"},
-        {L"GIF 画质   小体积 (≤800px)",L"GIF quality   Compact (≤800px)"},{L"GIF 画质   均衡 (≤1280px)",L"GIF quality   Balanced (≤1280px)"},{L"GIF 画质   原尺寸",L"GIF quality   Original"},{L"GIF 画质",L"GIF quality"},
+        {L"GIF 画质   小体积 (≤6MB)",L"GIF quality   Compact (≤6MB)"},{L"GIF 画质   均衡 (≤12MB)",L"GIF quality   Balanced (≤12MB)"},{L"GIF 画质   高清 (≤25MB)",L"GIF quality   HD (≤25MB)"},{L"GIF 画质",L"GIF quality"},
         {L"复制长截图（Enter）",L"Copy long capture (Enter)"},{L"保存长截图（Ctrl+S）",L"Save long capture (Ctrl+S)"},{L"取消长截图（Esc）",L"Cancel long capture (Esc)"},
         {L"长截图已复制到剪贴板。",L"Long screenshot copied to clipboard."},{L"长截图已保存为 PNG。",L"Long screenshot saved as PNG."},
         {L"框选单个显示器内的区域 · 向下滚动自动拼接",L"Select a region on one monitor · Scroll to stitch"},

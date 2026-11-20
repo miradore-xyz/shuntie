@@ -147,40 +147,41 @@ def main():
     video = OUT / "synthetic_1080p_5s.mp4"
     generate_test_video(video)
 
-    # 1) 均衡模式：15 fps，最长边 1280 -> 1280x720
-    balanced_gif = OUT / "balanced_1280.gif"
-    balanced_log = OUT / "balanced_1280.log"
+    # 1) 均衡模式：15 fps，最长边 1080 -> 1080x608，且体积 <= 12 MB
+    balanced_gif = OUT / "balanced_1080.gif"
+    balanced_log = OUT / "balanced_1080.log"
     balanced_log.unlink(missing_ok=True)
     t0 = time.perf_counter()
     subprocess.run(
         [str(EXPORTER), str(FFMPEG), "gifski.exe", str(video), str(balanced_gif), str(balanced_log),
-         "15", "1920", "1080", "1280", "1"],
+         "15", "1920", "1080", "1080", "1"],
         check=True, creationflags=subprocess.CREATE_NO_WINDOW
     )
     elapsed_bal = time.perf_counter() - t0
-    bal_frames, bal_ms = parse_and_verify_gif89a(balanced_gif, 1280, 720)
+    bal_frames, bal_ms = parse_and_verify_gif89a(balanced_gif, 1080, 608)
     bal_bytes = balanced_gif.stat().st_size
-    assert bal_bytes < 8 * 1024 * 1024, f"Balanced GIF too large: {bal_bytes} bytes"
+    assert bal_bytes <= 12 * 1024 * 1024, f"Balanced GIF too large: {bal_bytes} bytes"
     assert elapsed_bal < 5.0, f"Balanced GIF export too slow: {elapsed_bal:.2f}s"
 
-    # 2) 小体积模式：15 fps，最长边 800 -> 800x450
-    compact_gif = OUT / "compact_800.gif"
-    compact_log = OUT / "compact_800.log"
+    # 2) 小体积模式：12 fps，最长边 720 -> 720x404，且体积 <= 6 MB
+    compact_gif = OUT / "compact_720.gif"
+    compact_log = OUT / "compact_720.log"
     compact_log.unlink(missing_ok=True)
     t1 = time.perf_counter()
     subprocess.run(
         [str(EXPORTER), str(FFMPEG), "gifski.exe", str(video), str(compact_gif), str(compact_log),
-         "15", "1920", "1080", "800", "0"],
+         "15", "1920", "1080", "720", "0"],
         check=True, creationflags=subprocess.CREATE_NO_WINDOW
     )
     elapsed_cmp = time.perf_counter() - t1
-    cmp_frames, cmp_ms = parse_and_verify_gif89a(compact_gif, 800, 450)
+    cmp_frames, cmp_ms = parse_and_verify_gif89a(compact_gif, 720, 404)
     cmp_bytes = compact_gif.stat().st_size
+    assert cmp_bytes <= 6 * 1024 * 1024, f"Compact GIF too large: {cmp_bytes} bytes"
     assert cmp_bytes < bal_bytes, (cmp_bytes, bal_bytes)
     assert elapsed_cmp < 5.0, f"Compact GIF export too slow: {elapsed_cmp:.2f}s"
 
-    print(f"Balanced (1280x720, {bal_frames} frames, {bal_ms}ms): {bal_bytes / (1024*1024):.2f} MB in {elapsed_bal:.3f}s")
-    print(f"Compact  (800x450,  {cmp_frames} frames, {cmp_ms}ms): {cmp_bytes / (1024*1024):.2f} MB in {elapsed_cmp:.3f}s")
+    print(f"Balanced (1080x608, {bal_frames} frames, {bal_ms}ms): {bal_bytes / (1024*1024):.2f} MB in {elapsed_bal:.3f}s")
+    print(f"Compact  (720x404,  {cmp_frames} frames, {cmp_ms}ms): {cmp_bytes / (1024*1024):.2f} MB in {elapsed_cmp:.3f}s")
     print("QQ compatibility & performance checks passed.")
 
 
