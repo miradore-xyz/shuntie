@@ -2,8 +2,12 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <dxgi.h>
-#include <vector>
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <vector>
 
 namespace {
 std::wstring quote(const std::wstring& s) { return L"\""+s+L"\""; }
@@ -41,7 +45,122 @@ bool launch(Child& child,const std::wstring& exe,const std::wstring& args,const 
     return ok!=FALSE;
 }
 DWORD result(Child& child){WaitForSingleObject(child.process.hProcess,INFINITE);DWORD code=1;GetExitCodeProcess(child.process.hProcess,&code);return code;}
-bool nonempty(const std::wstring& path){WIN32_FILE_ATTRIBUTE_DATA d{};return GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&d) && (d.nFileSizeHigh || d.nFileSizeLow>0);}
+uint64_t fileSizeBytes(const std::wstring& path){
+    WIN32_FILE_ATTRIBUTE_DATA d{};
+    if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&d))return 0;
+    return (uint64_t(d.nFileSizeHigh)<<32)|uint64_t(d.nFileSizeLow);
+}
+bool nonempty(const std::wstring& path){return fileSizeBytes(path)>0;}
+constexpr uint64_t kVideoMaxBytes=20000000ULL;
+struct VideoCompressPlan {
+    int outWidth=0,outHeight=0,outFps=30,targetKbps=1500,maxrateKbps=1725,bufsizeKbps=3450,gop=120;
+};
+VideoCompressPlan planVideoCompression(double durationSec,int srcW,int srcH,uint64_t maxBytes=kVideoMaxBytes,double fillRatio=0.90){
+    durationSec=std::max(1.0,durationSec);
+    double aimBytes=double(maxBytes)*std::clamp(fillRatio,0.35,0.95);
+    int targetKbps=std::clamp(int(std::floor(aimBytes*8.0/1000.0/durationSec)),100,12000);
+    int maxLongSide=480,outFps=10;
+    if(targetKbps>=5500){maxLongSide=1920;outFps=30;}
+    else if(targetKbps>=3200){maxLongSide=1600;outFps=30;}
+    else if(targetKbps>=1800){maxLongSide=1280;outFps=24;}
+    else if(targetKbps>=900){maxLongSide=960;outFps=20;}
+    else if(targetKbps>=450){maxLongSide=720;outFps=15;}
+    else if(targetKbps>=220){maxLongSide=640;outFps=12;}
+    int outW=0,outH=0;
+    if(srcW>=2&&srcH>=2){
+        int evenW=srcW&~1,evenH=srcH&~1;
+        int longSide=std::max(evenW,evenH);
+        if(longSide>maxLongSide){
+            double scale=double(maxLongSide)/double(longSide);
+            outW=std::max(2,int(std::round(evenW*scale))&~1);
+            outH=std::max(2,int(std::round(evenH*scale))&~1);
+        }else{
+            outW=evenW;outH=evenH;
+        }
+    }
+    int maxrateKbps=std::max(targetKbps+50,int(std::round(targetKbps*1.15)));
+    int bufsizeKbps=std::max(targetKbps*2,maxrateKbps*2);
+    int gop=std::max(outFps*2,outFps*4);
+    return {outW,outH,outFps,targetKbps,maxrateKbps,bufsizeKbps,gop};
+}
+double probeVideoDurationSec(const std::wstring& ff,const std::wstring& inputMp4,double fallbackSec){
+    std::wstring probeLog=inputMp4+L".probe.log";
+    DeleteFileW(probeLog.c_str());
+    Child child;
+    if(launch(child,ff,L"-hide_banner -nostdin -i "+quote(inputMp4),probeLog))result(child);
+    std::ifstream in(probeLog.c_str(),std::ios::binary);
+    std::ostringstream ss;ss<<in.rdbuf();
+    std::string content=ss.str();
+    in.close();
+    DeleteFileW(probeLog.c_str());
+    size_t pos=content.find("Duration:");
+    if(pos!=std::string::npos){
+        int h=0,m=0;double s=0;
+        if(sscanf(content.c_str()+pos,"Duration: %d:%d:%lf",&h,&m,&s)==3){
+            double sec=h*3600.0+m*60.0+s;
+            if(sec>0.1)return sec;
+        }
+    }
+    return std::max(1.0,fallbackSec);
+}
+bool compressVideoToLimit(const std::wstring& ff,const std::wstring& inputMp4,const std::wstring& outputMp4,const std::wstring& log,ULONGLONG durationMs,int srcW,int srcH,uint64_t maxBytes=kVideoMaxBytes){
+    uint64_t rawBytes=fileSizeBytes(inputMp4);
+    if(rawBytes==0)return false;
+    if(rawBytes<=maxBytes){
+        if(inputMp4!=outputMp4)return CopyFileW(inputMp4.c_str(),outputMp4.c_str(),FALSE)!=FALSE&&nonempty(outputMp4);
+        return true;
+    }
+    double durationSec=probeVideoDurationSec(ff,inputMp4,double(durationMs)/1000.0);
+    auto runPass=[&](const VideoCompressPlan& plan,const std::wstring& dest,bool tightCap)->bool{
+        std::wstring vf=L"fps="+std::to_wstring(plan.outFps);
+        if(plan.outWidth>0&&plan.outHeight>0&&(plan.outWidth!=srcW||plan.outHeight!=srcH))
+            vf+=L",scale="+std::to_wstring(plan.outWidth)+L":"+std::to_wstring(plan.outHeight)+L":flags=area";
+        int maxrate=tightCap?std::max(plan.targetKbps+20,int(std::round(plan.targetKbps*1.05))):plan.maxrateKbps;
+        int bufsize=tightCap?std::max(plan.targetKbps,maxrate):plan.bufsizeKbps;
+        std::wstring commonTail=L" -pix_fmt yuv420p -profile:v high -an -movflags +faststart "+quote(dest);
+        for(int attempt=0;attempt<2;++attempt){
+            DeleteFileW(dest.c_str());
+            std::wstring args=L"-hide_banner -nostdin -y -i "+quote(inputMp4)+L" -vf "+vf;
+            if(attempt==0){
+                args+=L" -c:v h264_nvenc -preset p5 -rc vbr -multipass qres -g "+std::to_wstring(plan.gop)+
+                    L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
+                    L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+            }else{
+                args+=L" -c:v libx264 -preset veryfast -g "+std::to_wstring(plan.gop)+
+                    L" -b:v "+std::to_wstring(plan.targetKbps)+L"k -maxrate "+std::to_wstring(maxrate)+
+                    L"k -bufsize "+std::to_wstring(bufsize)+L"k"+commonTail;
+            }
+            Child child;
+            if(launch(child,ff,args,log)&&result(child)==0&&nonempty(dest))return true;
+        }
+        DeleteFileW(dest.c_str());
+        return false;
+    };
+    auto plan1=planVideoCompression(durationSec,srcW,srcH,maxBytes,0.90);
+    std::wstring tmp1=outputMp4+L".cmp1.mp4";
+    if(!runPass(plan1,tmp1,false)){DeleteFileW(tmp1.c_str());return false;}
+    uint64_t size1=fileSizeBytes(tmp1);
+    std::wstring bestTmp=tmp1;uint64_t bestSize=size1;
+    if(size1>maxBytes&&plan1.targetKbps>100){
+        double retryFill=std::clamp(0.84*(double(maxBytes)/double(size1)),0.42,0.82);
+        auto plan2=planVideoCompression(durationSec,srcW,srcH,maxBytes,retryFill);
+        std::wstring tmp2=outputMp4+L".cmp2.mp4";
+        if(runPass(plan2,tmp2,true)){
+            uint64_t size2=fileSizeBytes(tmp2);
+            if(size2>0&&size2<bestSize){
+                bestTmp=tmp2;bestSize=size2;DeleteFileW(tmp1.c_str());
+            }else{
+                DeleteFileW(tmp2.c_str());
+            }
+        }else{
+            DeleteFileW(tmp2.c_str());
+        }
+    }
+    if(!MoveFileExW(bestTmp.c_str(),outputMp4.c_str(),MOVEFILE_REPLACE_EXISTING)){
+        DeleteFileW(bestTmp.c_str());return false;
+    }
+    return nonempty(outputMp4);
+}
 // FFmpeg 默认 D3D11 设备的输出索引；无法匹配时交给兼容捕获。
 int outputFor(RECT area,RECT& monitor) {
     IDXGIFactory1* factory=nullptr;IDXGIAdapter1* adapter=nullptr;int match=-1;
@@ -55,6 +174,12 @@ int outputFor(RECT area,RECT& monitor) {
         }factory->Release();
     }return match;
 }
+}
+std::wstring formatFileSizeMB(uint64_t bytes){
+    double mb=double(bytes)/(1024.0*1024.0);
+    wchar_t buf[32]{};
+    swprintf(buf,32,mb>=1.0?L"%.1f MB":L"%.2f MB",mb);
+    return buf;
 }
 #include "record_session.inl"
 bool copyFileToClipboard(HWND owner,const std::wstring& file){

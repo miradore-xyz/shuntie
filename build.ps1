@@ -31,5 +31,9 @@ if ($Test) {
     if ($LASTEXITCODE -ne 0) { throw '长截图拼接测试失败' }
     & zig c++ -std=c++17 -O2 -municode tests/gif_export_test.cpp -o tools/gif-export-test.exe -luser32 -lshell32 -lole32 -ldxgi -luuid
     if ($LASTEXITCODE -ne 0) { throw 'GIF 导出回归入口编译失败' }
+    & zig c++ -std=c++17 -O2 -UNDEBUG -municode tests/video_compress_test.cpp -o tools/video-compress-test.exe -luser32 -lshell32 -lole32 -ldxgi -luuid
+    if ($LASTEXITCODE -ne 0) { throw '视频压缩测试编译失败' }
+    & .\tools\video-compress-test.exe
+    if ($LASTEXITCODE -ne 0) { throw '视频压缩测试失败' }
 }
 Write-Output '构建完成：dist\瞬贴.exe'

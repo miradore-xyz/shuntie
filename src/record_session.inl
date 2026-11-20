@@ -5,10 +5,10 @@ Recorder::~Recorder(){stop();if(worker.joinable())worker.join();for(HANDLE h:{st
 RecordingStatus Recorder::status(){std::lock_guard<std::mutex> lock(mutex);return current;}
 bool Recorder::busy(){auto p=status().phase;return p==RecordingStatus::Starting||p==RecordingStatus::Recording||p==RecordingStatus::Paused||p==RecordingStatus::Stopping||p==RecordingStatus::Exporting;}
 void Recorder::update(RecordingStatus::Phase p,const std::wstring& m){std::lock_guard<std::mutex> lock(mutex);current.phase=p;current.message=m;}
-bool Recorder::start(RECT area,const std::wstring& root,const std::wstring& output,int fps,int gifQuality){
+bool Recorder::start(RECT area,const std::wstring& root,const std::wstring& output,int fps,int gifQuality,RecordingStatus::Mode mode){
     if(busy())return false;if(worker.joinable())worker.join();for(HANDLE h:{stopEvent,pauseEvent,resumeEvent,copyEvent})ResetEvent(h);
-    {std::lock_guard<std::mutex> lock(mutex);current={};current.phase=RecordingStatus::Starting;current.message=L"正在启动录制…";}
-    worker=std::thread(&Recorder::run,this,area,root,output,fps,gifQuality);return true;
+    {std::lock_guard<std::mutex> lock(mutex);current={};current.mode=mode;current.phase=RecordingStatus::Starting;current.message=L"正在启动录制…";}
+    worker=std::thread(&Recorder::run,this,area,root,output,fps,gifQuality,mode);return true;
 }
 void Recorder::stop(){SetEvent(stopEvent);}
 void Recorder::pause(){if(status().phase==RecordingStatus::Recording)SetEvent(pauseEvent);}
@@ -35,14 +35,23 @@ bool encodeGif(const std::wstring& ff,const std::wstring& gifski,const std::wstr
     DWORD dc=dec?result(decoder):1,ec=enc?result(encoder):1;return dc==0&&ec==0&&nonempty(gif);
 }
 }
-void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int gifQuality){
+void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int gifQuality,RecordingStatus::Mode mode){
+    bool isVideo=mode==RecordingStatus::Video;
     std::wstring ff=root+L"\\bin\\ffmpeg.exe",gifski=root+L"\\bin\\gifski.exe",helper=root+L"\\bin\\gifski-export.exe";
-    if(!nonempty(ff)||(!nonempty(helper)&&!nonempty(gifski))){update(RecordingStatus::Failed,L"缺少编码器，请保留程序旁的 bin 文件夹。");return;}
-    SYSTEMTIME time;GetLocalTime(&time);wchar_t name[96];swprintf(name,96,L"\\录屏_%04d%02d%02d_%02d%02d%02d_%03d",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,time.wMilliseconds);
+    if(!nonempty(ff)||(!isVideo&&!nonempty(helper)&&!nonempty(gifski))){update(RecordingStatus::Failed,L"缺少编码器，请保留程序旁的 bin 文件夹。");return;}
+    SYSTEMTIME time;GetLocalTime(&time);wchar_t name[96];swprintf(name,96,isVideo?L"\\视频_%04d%02d%02d_%02d%02d%02d_%03d":L"\\录屏_%04d%02d%02d_%02d%02d%02d_%03d",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,time.wMilliseconds);
     std::wstring base=output+name,video=base+L".mp4",log=base+L".log",parts=base+L".片段";CreateDirectoryW(parts.c_str(),nullptr);
     int width=(area.right-area.left)&~1,height=(area.bottom-area.top)&~1;if(width<2||height<2){update(RecordingStatus::Failed,L"选区过小。");return;}
-    int capFps=std::clamp(fps,30,60);
+    int capFps=isVideo?30:std::clamp(fps,30,60);
     std::vector<std::wstring> segments;ULONGLONG elapsed=0;bool needCapture=true,finish=false,copy=false;int chosenBackend=-1,snapshot=0;size_t exportedSegments=0;std::wstring lastSnapshot;
+    auto exportVideoOutput=[&](const std::wstring& targetPath)->bool{
+        if(segments.empty())return false;
+        if(segments.size()==1)return compressVideoToLimit(ff,segments[0],targetPath,log,elapsed,width,height,kVideoMaxBytes);
+        std::wstring rawTmp=base+L".合并.mp4";
+        bool ok=mergeSegments(ff,segments,rawTmp,log)&&compressVideoToLimit(ff,rawTmp,targetPath,log,elapsed,width,height,kVideoMaxBytes);
+        DeleteFileW(rawTmp.c_str());
+        return ok&&nonempty(targetPath);
+    };
     while(!finish){
         if(needCapture){
             update(RecordingStatus::Starting,L"正在启动录制…");bool captured=false;
@@ -51,8 +60,8 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int g
                 if(WaitForSingleObject(stopEvent,0)==WAIT_OBJECT_0){finish=true;break;}
                 RECT monitor{};int index=outputFor(area,monitor);bool hardware=attempt==0&&index>=0;if(attempt==0&&!hardware)continue;
                 std::wstring args=L"-hide_banner -y ",backend;
-                if(hardware){args+=L"-f lavfi -i ddagrab=output_idx="+std::to_wstring(index)+L":framerate="+std::to_wstring(capFps)+L":draw_mouse=1:offset_x="+std::to_wstring(area.left-monitor.left)+L":offset_y="+std::to_wstring(area.top-monitor.top)+L":video_size="+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -c:v h264_nvenc -preset p1 -rc constqp -qp 18 -profile:v high ";backend=L"显卡捕获 · NVIDIA 硬件编码";}
-                else{args+=L"-f gdigrab -framerate "+std::to_wstring(capFps)+L" -draw_mouse 1 -offset_x "+std::to_wstring(area.left)+L" -offset_y "+std::to_wstring(area.top)+L" -video_size "+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -i desktop -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p ";backend=L"兼容捕获 · 软件编码";}
+                if(hardware){args+=L"-f lavfi -i ddagrab=output_idx="+std::to_wstring(index)+L":framerate="+std::to_wstring(capFps)+L":draw_mouse=1:offset_x="+std::to_wstring(area.left-monitor.left)+L":offset_y="+std::to_wstring(area.top-monitor.top)+L":video_size="+std::to_wstring(width)+L"x"+std::to_wstring(height)+(isVideo?L" -c:v h264_nvenc -preset p1 -rc constqp -qp 21 -g 120 -profile:v high ":L" -c:v h264_nvenc -preset p1 -rc constqp -qp 18 -profile:v high ");backend=L"显卡捕获 · NVIDIA 硬件编码";}
+                else{args+=L"-f gdigrab -framerate "+std::to_wstring(capFps)+L" -draw_mouse 1 -offset_x "+std::to_wstring(area.left)+L" -offset_y "+std::to_wstring(area.top)+L" -video_size "+std::to_wstring(width)+L"x"+std::to_wstring(height)+L" -i desktop -c:v libx264 -preset ultrafast "+(isVideo?L"-crf 21 -g 120 -pix_fmt yuv420p ":L"-crf 18 -pix_fmt yuv420p ");backend=L"兼容捕获 · 软件编码";}
                 args+=L"-an -fps_mode cfr -r "+std::to_wstring(capFps)+L" -movflags +faststart "+quote(segment);
                 Child child;ULONGLONG began=GetTickCount64();if(!launch(child,ff,args,log))continue;
                 if(WaitForSingleObject(child.process.hProcess,1000)==WAIT_OBJECT_0)continue;
@@ -69,19 +78,35 @@ void Recorder::run(RECT area,std::wstring root,std::wstring output,int fps,int g
         }
         if(finish)break;
         if(copy){
-            update(RecordingStatus::Exporting,L"正在生成并复制 GIF…");std::wstring gif=base+L"_快照"+std::to_wstring(++snapshot)+L".gif";
-            bool ok=mergeSegments(ff,segments,video,log)&&encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality);if(ok){exportedSegments=segments.size();lastSnapshot=gif;}
-            {std::lock_guard<std::mutex> lock(mutex);if(ok){current.gif=gif;++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"GIF 已生成，录制保持暂停":L"GIF 导出失败，可重试或继续录制";}
+            if(isVideo){
+                update(RecordingStatus::Exporting,L"正在压缩并复制视频…");std::wstring snapVideo=base+L"_快照"+std::to_wstring(++snapshot)+L".mp4";
+                bool ok=exportVideoOutput(snapVideo);if(ok){exportedSegments=segments.size();lastSnapshot=snapVideo;}
+                {std::lock_guard<std::mutex> lock(mutex);if(ok){current.video=snapVideo;current.exportedBytes=fileSizeBytes(snapVideo);++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"视频已生成，录制保持暂停":L"视频导出失败，可重试或继续录制";}
+            }else{
+                update(RecordingStatus::Exporting,L"正在生成并复制 GIF…");std::wstring gif=base+L"_快照"+std::to_wstring(++snapshot)+L".gif";
+                bool ok=mergeSegments(ff,segments,video,log)&&encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality);if(ok){exportedSegments=segments.size();lastSnapshot=gif;}
+                {std::lock_guard<std::mutex> lock(mutex);if(ok){current.gif=gif;current.exportedBytes=fileSizeBytes(gif);++current.copyVersion;}current.phase=RecordingStatus::Paused;current.message=ok?L"GIF 已生成，录制保持暂停":L"GIF 导出失败，可重试或继续录制";}
+            }
             copy=false;
         }else update(RecordingStatus::Paused,L"已暂停");
         HANDLE events[]={stopEvent,resumeEvent,copyEvent};DWORD reason=WaitForMultipleObjects(3,events,FALSE,INFINITE);
         finish=reason==WAIT_OBJECT_0;needCapture=reason==WAIT_OBJECT_0+1;copy=reason==WAIT_OBJECT_0+2;
     }
     if(segments.empty()){RemoveDirectoryW(parts.c_str());update(RecordingStatus::Idle,L"已取消录制");return;}
-    update(RecordingStatus::Exporting,L"正在保存视频并导出 GIF…");std::wstring gif=base+L".gif";
-    bool ready=exportedSegments==segments.size()&&!lastSnapshot.empty()&&nonempty(video)&&CopyFileW(lastSnapshot.c_str(),gif.c_str(),FALSE);
-    if(!ready&&(!mergeSegments(ff,segments,video,log)||!encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality))){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
-    // 成功输出完整视频和 GIF 后才清理本次会话的片段文件。
-    for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
-    {std::lock_guard<std::mutex> lock(mutex);current.gif=gif;current.video=video;current.phase=RecordingStatus::Complete;current.message=L"GIF 已导出";}
+    if(isVideo){
+        update(RecordingStatus::Exporting,L"正在保存并压缩视频…");
+        bool ready=exportedSegments==segments.size()&&!lastSnapshot.empty()&&nonempty(lastSnapshot)&&CopyFileW(lastSnapshot.c_str(),video.c_str(),FALSE);
+        if(!ready&&!exportVideoOutput(video)){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
+        for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
+        uint64_t finalBytes=fileSizeBytes(video);
+        {std::lock_guard<std::mutex> lock(mutex);current.gif.clear();current.video=video;current.exportedBytes=finalBytes;current.phase=RecordingStatus::Complete;current.message=L"视频已导出 · "+formatFileSizeMB(finalBytes);}
+    }else{
+        update(RecordingStatus::Exporting,L"正在保存视频并导出 GIF…");std::wstring gif=base+L".gif";
+        bool ready=exportedSegments==segments.size()&&!lastSnapshot.empty()&&nonempty(video)&&CopyFileW(lastSnapshot.c_str(),gif.c_str(),FALSE);
+        if(!ready&&(!mergeSegments(ff,segments,video,log)||!encodeGif(ff,gifski,video,gif,log,fps,width,height,gifQuality))){update(RecordingStatus::Failed,L"导出失败，已录片段保留；详情见同名日志。");return;}
+        // 成功输出完整视频和 GIF 后才清理本次会话的片段文件。
+        for(const auto& segment:segments)DeleteFileW(segment.c_str());RemoveDirectoryW(parts.c_str());
+        uint64_t finalBytes=fileSizeBytes(gif);
+        {std::lock_guard<std::mutex> lock(mutex);current.gif=gif;current.video=video;current.exportedBytes=finalBytes;current.phase=RecordingStatus::Complete;current.message=L"GIF 已导出 · "+formatFileSizeMB(finalBytes);}
+    }
 }

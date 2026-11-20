@@ -5,7 +5,16 @@
 inline bool english=false;
 inline std::wstring localize(std::wstring value){
     static const std::pair<const wchar_t*,const wchar_t*> dictionary[]={
-        {L"截图、标注、贴图。",L"Capture. Mark up. Pin."},{L"录下操作，一键复制 GIF。",L"Record it. Copy as GIF."},
+        {L"截图、标注、贴图。",L"Capture. Mark up. Pin."},{L"录下操作，一键复制 GIF 或视频。",L"Record it. Copy as GIF or MP4."},{L"录下操作，一键复制 GIF。",L"Record it. Copy as GIF."},
+        {L"框选单个显示器内的区域 · 超过 20 秒自动压缩至 20MB 内",L"Select a region on one monitor · Auto-compressed ≤20MB over 20s"},
+        {L"按 Esc 取消 · 超过 20 秒自动压缩至 20MB 内",L"Esc to cancel · Auto-compressed ≤20MB over 20s"},
+        {L"视频文件已复制，可粘贴到聊天或编辑软件。",L"Video file copied. Paste it into an app that supports files."},
+        {L"视频已生成，剪贴板繁忙，请重试复制",L"Video ready. Clipboard busy; try copying again."},
+        {L"复制已录视频（会暂停）",L"Copy recorded video (pauses)"},
+        {L"录视频 (MP4) / 停止",L"Record MP4 / Finish"},{L"录 GIF / 停止",L"Record GIF / Finish"},
+        {L"录视频（MP4）",L"Record video (MP4)"},{L"瞬贴 · 框选录视频",L"Shuntie · Video capture"},
+        {L"框选录视频区域",L"Select video area"},{L"开始录视频",L"Start video"},{L"开始录 GIF",L"Start GIF"},{L"录 GIF",L"Record GIF"},
+        {L"视频已导出",L"Video exported"},{L"视频已复制",L"Video copied"},{L"复制视频",L"Copy video"},{L"打开视频",L"Open video"},{L"压缩中…",L"Compressing…"},
         {L"鼠标悬停查看工具",L"Hover to see the tool"},{L"点击修改快捷键",L"Click to change keys"},
         {L"请按新的快捷键…",L"Press a shortcut…"},{L"未设置",L"Not set"},{L"（占用）",L" (in use)"},
         {L"清除截图快捷键",L"Clear capture shortcut"},{L"清除贴图快捷键",L"Clear pin shortcut"},{L"清除录屏快捷键",L"Clear record shortcut"},

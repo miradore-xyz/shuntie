@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
-names = ['scan-line','clipboard-paste','video','copy','folder-open','minus','x','mouse-pointer-2','square','move-up-right','pencil','grid-2x2','palette','undo-2','redo-2','save','pin','refresh-cw','circle-stop','sliders-horizontal','play','pause','chevrons-down','mouse-pointer-click']
+names = ['scan-line','clipboard-paste','video','film','copy','folder-open','minus','x','mouse-pointer-2','square','move-up-right','pencil','grid-2x2','palette','undo-2','redo-2','save','pin','refresh-cw','circle-stop','sliders-horizontal','play','pause','chevrons-down','mouse-pointer-click']
 
 def num(v):
     return f'{float(v):.6g}f' if '.' in f'{float(v):.6g}' else f'{float(v):.6g}.0f'

@@ -3,15 +3,18 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
 
 struct RecordingStatus {
     enum Phase { Idle, Starting, Recording, Paused, Stopping, Exporting, Complete, Failed } phase=Idle;
+    enum Mode { Gif, Video } mode=Gif;
     std::wstring message=L"就绪", video, gif, backend;
     ULONGLONG started=0;
     ULONGLONG elapsedMs=0;
+    uint64_t exportedBytes=0;
     unsigned copyVersion=0;
 };
 class Recorder {
@@ -22,13 +25,13 @@ class Recorder {
     HANDLE pauseEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     HANDLE resumeEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     HANDLE copyEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-    void run(RECT area, std::wstring root, std::wstring output, int fps, int gifQuality);
+    void run(RECT area, std::wstring root, std::wstring output, int fps, int gifQuality, RecordingStatus::Mode mode);
     void update(RecordingStatus::Phase phase, const std::wstring& message);
 public:
     ~Recorder();
     RecordingStatus status();
     bool busy();
-    bool start(RECT area,const std::wstring& root,const std::wstring& output,int gifFps,int gifQuality=1);
+    bool start(RECT area,const std::wstring& root,const std::wstring& output,int gifFps,int gifQuality=1,RecordingStatus::Mode mode=RecordingStatus::Gif);
     void stop();
     void pause();
     void resume();
@@ -36,3 +39,4 @@ public:
 };
 // 以文件格式写入剪贴板，保留动画；同时声明“复制”拖放语义。
 bool copyFileToClipboard(HWND owner,const std::wstring& file);
+std::wstring formatFileSizeMB(uint64_t bytes);

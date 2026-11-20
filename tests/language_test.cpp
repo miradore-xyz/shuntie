@@ -14,6 +14,13 @@ int main(){
     assert(localize(L"鼠标点击显示   已开启")==L"Click indicator   On");
     assert(localize(L"长截图")==L"Long capture");
     assert(localize(L"向下滚动自动拼接")==L"Scroll down to stitch");
+    assert(localize(L"录视频（MP4）")==L"Record video (MP4)");
+    assert(localize(L"录视频 (MP4) / 停止")==L"Record MP4 / Finish");
+    assert(localize(L"录 GIF / 停止")==L"Record GIF / Finish");
+    assert(localize(L"视频已导出 · 14.2 MB")==L"Video exported · 14.2 MB");
+    assert(localize(L"GIF 已导出 · 8.4 MB")==L"GIF exported · 8.4 MB");
+    assert(localize(L"打开视频")==L"Open video");
+    assert(localize(L"压缩中…")==L"Compressing…");
     english=false;
     assert(localize(L"Capture  Ctrl+1")==L"截图  Ctrl+1");
     assert(localize(L"Record  Not set")==L"录屏  未设置");
@@ -22,5 +29,12 @@ int main(){
     assert(localize(L"Click indicator   On")==L"鼠标点击显示   已开启");
     assert(localize(L"Long capture")==L"长截图");
     assert(localize(L"Scroll down to stitch")==L"向下滚动自动拼接");
+    assert(localize(L"Record video (MP4)")==L"录视频（MP4）");
+    assert(localize(L"Record MP4 / Finish")==L"录视频 (MP4) / 停止");
+    assert(localize(L"Record GIF / Finish")==L"录 GIF / 停止");
+    assert(localize(L"Video exported · 14.2 MB")==L"视频已导出 · 14.2 MB");
+    assert(localize(L"GIF exported · 8.4 MB")==L"GIF 已导出 · 8.4 MB");
+    assert(localize(L"Open video")==L"打开视频");
+    assert(localize(L"Compressing…")==L"压缩中…");
     std::cout<<"Language switching and dynamic values passed. / 中英文切换及动态值通过。\n";
 }

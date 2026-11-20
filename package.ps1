@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $cnIsl)) {
 }
 & $InnoCompiler installer.iss
 if ($LASTEXITCODE -ne 0) { throw '安装包生成失败。' }
-$version = '0.1.7'
+$version = '0.1.8'
 $portableDir = Join-Path $PSScriptRoot 'tools\portable-package'
 if (Test-Path -LiteralPath $portableDir) { Remove-Item -LiteralPath $portableDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
