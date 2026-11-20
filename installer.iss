@@ -1,5 +1,5 @@
 ; 当前用户安装，无需管理员权限。开机启动由用户在安装时选择。
-#define AppVersion "0.1.5"
+#define AppVersion "0.1.6"
 [Setup]
 AppId={{0E226C97-BCB8-4DCC-922E-38DA79D48D57}
 AppName=瞬贴

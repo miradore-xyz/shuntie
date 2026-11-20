@@ -3,7 +3,8 @@
 Windows 截图、可编辑标注、桌面贴图和区域录屏工具。使用小型深色圆角界面和 Lucide 图标，支持中文与 English（英语）。
 
 - 悬停识别窗口、拖动自由框选，选区四角和边缘可继续调整；方框、箭头、画笔和马赛克可选择、移动、缩放、旋转。
-- 录屏支持范围边框、暂停/继续、复制已录 GIF 和结束录制。
+- 支持长截图：截图工具栏（或按 `L`）/ 托盘菜单进入，自动过滤滚动条与固定页眉/页脚，支持手动滚轮实时拼接与自动向下滚动。
+- 录屏支持范围边框、暂停/继续、鼠标点击波纹高亮、复制已录 GIF 和结束录制；采用单全局调色板全画幅 GIF89a 编码，兼容 QQ 群聊并大幅降低体积与导出耗时。
 - 一键安装，默认勾选开机启动，可手动取消。
 
 安装包和便携版见本仓库的 Releases（发行版）页面。详细操作和当前边界见 [中文说明](README.zh-CN.md)。
@@ -17,8 +18,9 @@ Windows 截图、可编辑标注、桌面贴图和区域录屏工具。使用小
 ./tools/fetch_dependencies.ps1
 # 编译主程序，并检查对象几何和中英文切换。
 ./build.ps1 -Test
-# 后台 GIF 文件回归：需 Python 与 Pillow，不操作桌面。
+# 后台 GIF 文件回归与 QQ 兼容测试：需 Python 与 Pillow，不操作桌面。
 python ./tests/gif_native_test.py
+python ./tests/gif_qq_compat_test.py
 # 生成安装版和便携版，需要 Inno Setup 的 ISCC.exe。
 ./package.ps1 -InnoCompiler 'C:\路径\ISCC.exe'
 ```

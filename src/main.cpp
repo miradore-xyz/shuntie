@@ -15,6 +15,7 @@
 #include <uxtheme.h>
 #include "graphics.hpp"
 #include "recorder.hpp"
+#include "click_overlay.hpp"
 #include "icons.hpp"
 #include "window_snap.hpp"
 #include <fstream>
@@ -22,28 +23,31 @@
 namespace {
 constexpr unsigned BG=0x161A1F, INK=0xECF0F3, MUTED=0xA6AFB9, ACCENT=0x7CE6C5;
 constexpr UINT TRAY_MESSAGE=WM_APP+1;
+enum class CaptureMode {Screenshot,Record,Scroll};
 HINSTANCE instance;
-HWND mainWindow=nullptr,overlay=nullptr,recordPanel=nullptr,recordFrame=nullptr,settingsWindow=nullptr;
+HWND mainWindow=nullptr,overlay=nullptr,recordPanel=nullptr,recordFrame=nullptr,settingsWindow=nullptr,scrollPanel=nullptr,scrollFrame=nullptr;
 std::wstring root,outputDir,notice;
 Recorder recorder;
+ClickOverlay clickOverlay;
 HFONT uiFont=nullptr;
 HICON appIcon=nullptr;
 HICON smallIcon=nullptr;
 NOTIFYICONDATAW tray{};
-bool captureHotkey=false,pinHotkey=false,recordHotkey=false;
+bool captureHotkey=false,pinHotkey=false,recordHotkey=false,scrollAutoMode=false,showClickEffect=true;
 Image lastImage;
 Image brandImage;
 float mainScale=1;
-int gifFps=30,waitingHotkey=0;
+int gifFps=15,gifQuality=1,waitingHotkey=0;
 UINT keyModifiers[]={0,0,MOD_ALT},keyCodes[]={VK_F1,VK_F3,'G'};
-enum Command {Capture=101,PinClipboard,Record,Folder,Hide,Exit,CopyGif,OpenVideo,FrameRate,
+enum Command {Capture=101,PinClipboard,Record,Folder,Hide,Exit,CopyGif,OpenVideo,FrameRate,LongCapture,
     Select=201,Rectangle,Arrow,Pen,Mosaic,Color,Thickness,Undo,Redo,Copy,Save,Pin,Reselect,Cancel,StartRecord,StopRecord,
-    Settings=301,Back,FpsToggle,AutoStart,KeyCapture,KeyPin,KeyRecord};
-constexpr int ClearCapture=311,ClearPin=312,ClearRecord=313,PauseRecord=320,CopyRecording=321;
+    ScrollAuto=251,ScrollCopy,ScrollSave,ScrollPin,ScrollCancel,
+    Settings=301,Back,FpsToggle,AutoStart,KeyCapture,KeyPin,KeyRecord,GifQualityToggle,ClickEffectToggle};
+constexpr int ClearCapture=311,ClearPin=312,ClearRecord=313,PauseRecord=320,CopyRecording=321,ToggleClicks=322;
 constexpr int Language=330;
-void showMain();void beginCapture(bool recording);void pinImage(Image image);void finishCapture(int action);void refreshStatus();
+void showMain();void beginCapture(CaptureMode mode);inline void beginCapture(bool recording){beginCapture(recording?CaptureMode::Record:CaptureMode::Screenshot);}void pinImage(Image image);void finishCapture(int action);void refreshStatus();
 void showSettings();void registerKeys();void mainCommand(int id);
-void beginRecordingUI(RECT area);
+void beginRecordingUI(RECT area);void beginScrollUI(RECT area);void endScrollUI();
 bool isToolSelected(int id);
 bool isEditorStrip(HWND button);
 LRESULT CALLBACK hoverProc(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);
@@ -67,12 +71,12 @@ void drawButton(DRAWITEMSTRUCT* d){
     HBRUSH brush=CreateSolidBrush(bg);HPEN pen=CreatePen(PS_SOLID,1,bg);HGDIOBJ oldBrush=SelectObject(d->hDC,brush),oldPen=SelectObject(d->hDC,pen);
     RoundRect(d->hDC,d->rcItem.left,d->rcItem.top,d->rcItem.right,d->rcItem.bottom,10,10);
     SelectObject(d->hDC,oldBrush);SelectObject(d->hDC,oldPen);DeleteObject(brush);DeleteObject(pen);
-    Icon icon=Icon::scan_line;bool hasIcon=true,iconOnly=d->CtlID==Settings||d->CtlID==Back||inStrip||(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord)||GetParent(d->hwndItem)==recordPanel||(GetParent(d->hwndItem)==overlay&&d->CtlID!=StartRecord);
-    switch(d->CtlID){case Settings:case FpsToggle:case Thickness:icon=Icon::sliders_horizontal;break;case Back:case Cancel:case Exit:icon=Icon::x;break;case Capture:case KeyCapture:case Reselect:icon=Icon::scan_line;break;case PinClipboard:case KeyPin:icon=Icon::clipboard_paste;break;case Record:case KeyRecord:case OpenVideo:case StartRecord:icon=Icon::video;break;case Copy:case CopyGif:icon=Icon::copy;break;case Folder:icon=Icon::folder_open;break;case Hide:icon=Icon::minus;break;case Select:icon=Icon::mouse_pointer_2;break;case Rectangle:icon=Icon::square;break;case Arrow:icon=Icon::move_up_right;break;case Pen:icon=Icon::pencil;break;case Mosaic:icon=Icon::grid_2x2;break;case Color:icon=Icon::palette;break;case Undo:icon=Icon::undo_2;break;case Redo:icon=Icon::redo_2;break;case Save:icon=Icon::save;break;case Pin:icon=Icon::pin;break;case StopRecord:icon=Icon::circle_stop;break;default:hasIcon=false;}
-    if(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord){icon=Icon::x;hasIcon=true;}if(d->CtlID==CopyRecording){icon=Icon::copy;hasIcon=true;}if(d->CtlID==PauseRecord){icon=recorder.status().phase==RecordingStatus::Paused?Icon::play:Icon::pause;hasIcon=true;}
+    Icon icon=Icon::scan_line;bool hasIcon=true,iconOnly=d->CtlID==Settings||d->CtlID==Back||inStrip||(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord)||GetParent(d->hwndItem)==recordPanel||GetParent(d->hwndItem)==scrollPanel||GetParent(d->hwndItem)==overlay;
+    switch(d->CtlID){case Settings:case FpsToggle:case GifQualityToggle:case Thickness:icon=Icon::sliders_horizontal;break;case Back:case Cancel:case ScrollCancel:case Exit:icon=Icon::x;break;case Capture:case KeyCapture:case Reselect:icon=Icon::scan_line;break;case PinClipboard:case KeyPin:icon=Icon::clipboard_paste;break;case Record:case KeyRecord:case OpenVideo:case StartRecord:icon=Icon::video;break;case Copy:case CopyGif:case ScrollCopy:icon=Icon::copy;break;case Folder:icon=Icon::folder_open;break;case Hide:icon=Icon::minus;break;case Select:icon=Icon::mouse_pointer_2;break;case Rectangle:icon=Icon::square;break;case Arrow:icon=Icon::move_up_right;break;case Pen:icon=Icon::pencil;break;case Mosaic:icon=Icon::grid_2x2;break;case Color:icon=Icon::palette;break;case Undo:icon=Icon::undo_2;break;case Redo:icon=Icon::redo_2;break;case Save:case ScrollSave:icon=Icon::save;break;case Pin:case ScrollPin:icon=Icon::pin;break;case LongCapture:icon=Icon::chevrons_down;break;case ToggleClicks:case ClickEffectToggle:icon=Icon::mouse_pointer_click;break;case StopRecord:icon=Icon::circle_stop;break;default:hasIcon=false;}
+    if(d->CtlID>=ClearCapture&&d->CtlID<=ClearRecord){icon=Icon::x;hasIcon=true;}if(d->CtlID==CopyRecording){icon=Icon::copy;hasIcon=true;}if(d->CtlID==PauseRecord){icon=recorder.status().phase==RecordingStatus::Paused?Icon::play:Icon::pause;hasIcon=true;}if(d->CtlID==ScrollAuto){icon=scrollAutoMode?Icon::pause:Icon::play;hasIcon=true;}
     float scale=float(GetDpiForWindow(d->hwndItem))/96,iw=(iconOnly?21:18)*scale,h=float(d->rcItem.bottom-d->rcItem.top),w=float(d->rcItem.right-d->rcItem.left);
     ID2D1DCRenderTarget* rt=nullptr;auto properties=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE),96,96);d2d->CreateDCRenderTarget(&properties,&rt);
-    if(rt){rt->BindDC(d->hDC,&d->rcItem);rt->BeginDraw();rt->Clear(rgb(inStrip?0x20262E:BG));unsigned fg=disabled?0x73808D:primary?0x11251E:inStrip&&(isToolSelected(d->CtlID)||d->CtlID==Copy)?ACCENT:INK;
+    if(rt){rt->BindDC(d->hDC,&d->rcItem);rt->BeginDraw();rt->Clear(rgb(inStrip?0x20262E:BG));bool activeStrip=isToolSelected(d->CtlID)||d->CtlID==Copy||d->CtlID==ScrollCopy||(d->CtlID==ToggleClicks&&showClickEffect)||(d->CtlID==ScrollAuto&&scrollAutoMode);unsigned fg=disabled?0x73808D:primary?0x11251E:inStrip&&activeStrip?ACCENT:INK;
         ID2D1SolidColorBrush* surface=nullptr;bool hover=hoveredButton==d->hwndItem;unsigned background=inStrip?(down?0x353D46:hover?0x2D3641:0x20262E):disabled?0x1C2127:primary?(down?0x57B899:ACCENT):(down?0x353D46:hover?0x303943:0x242A32);rt->CreateSolidColorBrush(rgb(background),&surface);if(surface){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0,0,w,h),7*scale,7*scale),surface);release(surface);}
         if(hasIcon)drawIcon(rt,icon,iconOnly?(w-iw)/2:12*scale,(h-iw)/2,iw,fg);
         if(!iconOnly){wchar_t label[128];GetWindowTextW(d->hwndItem,label,128);IDWriteTextFormat* format=nullptr;ID2D1SolidColorBrush* b=nullptr;writeFactory->CreateTextFormat(L"Microsoft YaHei UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,13*scale,L"zh-cn",&format);rt->CreateSolidColorBrush(rgb(fg),&b);if(format&&b){format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);rt->DrawText(label,UINT(wcslen(label)),format,D2D1::RectF(0,0,w,h),b);}release(format);release(b);}
@@ -126,7 +130,8 @@ void pinImage(Image image){
 struct Editor {
     Image screen;RECT desktop{};snip::Box selection{};snip::Tool tool=snip::Tool::Rectangle;
     std::vector<snip::Shape> shapes;std::vector<std::vector<snip::Shape>> past,future;
-    bool selected=false,recording=false,dragging=false,selecting=false,moving=false,resizing=false,rotating=false;
+    CaptureMode mode=CaptureMode::Screenshot;
+    bool selected=false,dragging=false,selecting=false,moving=false,resizing=false,rotating=false;
     bool adjustingArea=false,hoverSnap=false,toolbarVisible=false;
     int areaEdge=-1;
     snip::Box areaBefore,hoverSelection;
@@ -139,8 +144,8 @@ struct Editor {
     void checkpoint(){past.push_back(shapes);if(past.size()>60)past.erase(past.begin());future.clear();}
     void history(bool redo){auto& from=redo?future:past;auto& to=redo?past:future;if(from.empty())return;to.push_back(shapes);shapes=from.back();from.pop_back();active=-1;}
 } editor;
-bool isEditorStrip(HWND b){HWND parent=GetParent(b);return parent&&(parent==overlay||parent==recordPanel);}
-bool isToolSelected(int id){return overlay&&!editor.recording&&((id==Select&&editor.tool==snip::Tool::Select)||(id==Rectangle&&editor.tool==snip::Tool::Rectangle)||(id==Arrow&&editor.tool==snip::Tool::Arrow)||(id==Pen&&editor.tool==snip::Tool::Pen)||(id==Mosaic&&editor.tool==snip::Tool::Mosaic));}
+bool isEditorStrip(HWND b){HWND parent=GetParent(b);return parent&&(parent==overlay||parent==recordPanel||parent==scrollPanel);}
+bool isToolSelected(int id){return overlay&&editor.mode==CaptureMode::Screenshot&&((id==Select&&editor.tool==snip::Tool::Select)||(id==Rectangle&&editor.tool==snip::Tool::Rectangle)||(id==Arrow&&editor.tool==snip::Tool::Arrow)||(id==Pen&&editor.tool==snip::Tool::Pen)||(id==Mosaic&&editor.tool==snip::Tool::Mosaic));}
 const unsigned colors[]={0xFF6554,0xFF9D57,0xFFCF4A,0x7CE6C5,0x3478F6,0xA58BFA,0xF472B6,0xFFFFFF,0xAFB7C1,0x64748B,0x007F78,0x182B35};
 HWND paletteWindow=nullptr;
 LRESULT CALLBACK paletteProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
@@ -157,29 +162,32 @@ void showPalette(){if(paletteWindow){DestroyWindow(paletteWindow);return;}RECT r
 
 void layoutToolbar(){
     editor.toolbarVisible=true;
+    bool simpleBar=editor.mode!=CaptureMode::Screenshot;
     int total=int(editor.toolbar.size()),gap=int(4*mainScale),h=int(40*mainScale),w=int(40*mainScale);
-    int separator=editor.recording?0:int(8*mainScale),panelW=total*(w+gap)+gap+4*separator;int left=std::clamp(int((editor.selection.l+editor.selection.r)/2)-panelW/2,10,std::max(10,editor.screen.width-panelW-10));
+    int separator=simpleBar?0:int(8*mainScale),panelW=total*(w+gap)+gap+(simpleBar?0:4*separator);int left=std::clamp(int((editor.selection.l+editor.selection.r)/2)-panelW/2,10,std::max(10,editor.screen.width-panelW-10));
     int top=int(editor.selection.b)+12;if(top+h+32>editor.screen.height)top=std::max(8,int(editor.selection.t)-h-40);
     editor.toolbarBounds={left-gap,top-gap,left+panelW+gap,top+h+gap};
     // 隐藏创建控件，批量提交位置与可见性，避免逐个弹出及中途重绘。
     HDWP positions=BeginDeferWindowPos(total);int offset=gap;
-    for(int i=0;i<total;++i){positions=DeferWindowPos(positions,editor.toolbar[i],nullptr,left+offset,top,w,h,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_SHOWWINDOW);offset+=w+gap;if(i==4||i==6||i==8||i==12)offset+=separator;}
+    for(int i=0;i<total;++i){positions=DeferWindowPos(positions,editor.toolbar[i],nullptr,left+offset,top,w,h,SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_SHOWWINDOW);offset+=w+gap;if(!simpleBar&&(i==4||i==6||i==8||i==13))offset+=separator;}
     if(positions)EndDeferWindowPos(positions);
     if(editor.hint)ShowWindow(editor.hint,SW_HIDE);
     RedrawWindow(overlay,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN|RDW_NOERASE);
 }
 void toolHint(){
     if(!editor.hint)return;std::wstring value;
-    if(editor.recording)value=L"框选单个显示器内的区域 · 录制不包含声音";
+    if(editor.mode==CaptureMode::Record)value=L"框选单个显示器内的区域 · 录制不包含声音";
+    else if(editor.mode==CaptureMode::Scroll)value=L"框选单个显示器内的区域 · 向下滚动自动拼接";
     else if(editor.tool==snip::Tool::Select)value=L"拖动对象或右下角控制点 · Delete 删除 · Ctrl+Z 撤销";
     else value=L"当前工具可连续绘制 · V 选择编辑 · Ctrl+Z 撤销 · Enter 复制 · Esc 取消";
     setLabel(editor.hint,value.c_str());
 }
 void createToolbar(){
     if(!editor.toolbar.empty()){layoutToolbar();return;}
-    if(editor.recording){editor.toolbar.push_back(button(overlay,StartRecord,L"开始录制",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Reselect,L"重新框选",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Cancel,L"取消",0,0,0,0,false));}
+    if(editor.mode==CaptureMode::Record){editor.toolbar.push_back(button(overlay,StartRecord,L"开始录制",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Reselect,L"重新框选",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Cancel,L"取消",0,0,0,0,false));}
+    else if(editor.mode==CaptureMode::Scroll){editor.toolbar.push_back(button(overlay,LongCapture,L"长截图",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Reselect,L"重新框选",0,0,0,0,false));editor.toolbar.push_back(button(overlay,Cancel,L"取消",0,0,0,0,false));}
     else{
-        const std::pair<int,const wchar_t*> entries[]={{Select,L"选择（V）"},{Rectangle,L"方框（R）"},{Arrow,L"箭头（A）"},{Pen,L"画笔（P）"},{Mosaic,L"马赛克（M）"},{Color,L"颜色：红色"},{Thickness,L"线宽：3"},{Undo,L"撤销（Ctrl+Z）"},{Redo,L"重做（Ctrl+Y）"},{Copy,L"复制截图（Enter）"},{Save,L"保存（Ctrl+S）"},{Pin,L"贴图"},{StartRecord,L"录制选区"},{Reselect,L"重新框选"},{Cancel,L"取消（Esc）"}};
+        const std::pair<int,const wchar_t*> entries[]={{Select,L"选择（V）"},{Rectangle,L"方框（R）"},{Arrow,L"箭头（A）"},{Pen,L"画笔（P）"},{Mosaic,L"马赛克（M）"},{Color,L"颜色：红色"},{Thickness,L"线宽：3"},{Undo,L"撤销（Ctrl+Z）"},{Redo,L"重做（Ctrl+Y）"},{Copy,L"复制截图（Enter）"},{Save,L"保存（Ctrl+S）"},{Pin,L"贴图"},{LongCapture,L"长截图（L）"},{StartRecord,L"录制选区"},{Reselect,L"重新框选"},{Cancel,L"取消（Esc）"}};
         for(auto e:entries)editor.toolbar.push_back(button(overlay,e.first,e.second,0,0,0,0,false));
     }
     editor.hint=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT,0,0,0,0,overlay,nullptr,instance,nullptr);SendMessageW(editor.hint,WM_SETFONT,reinterpret_cast<WPARAM>(uiFont),TRUE);
@@ -199,8 +207,8 @@ void paintEditor(HWND hwnd){
             float labelY=s.t>=34?s.t-32:s.t+6;fill(rt,{s.l,labelY,s.l+150,labelY+28},0x20262E,.98f);text(rt,size,{s.l+8,labelY+2,s.l+148,labelY+28},17,0xECF0F3);
             if(editor.active>=0&&editor.active<int(editor.shapes.size())&&snip::selectionFrameVisible(editor.shapes[editor.active].tool,editor.dragging&&!editor.moving&&!editor.resizing&&!editor.rotating&&!editor.adjustingArea)){auto& shape=editor.shapes[editor.active];bool drawing=editor.dragging&&!editor.moving&&!editor.resizing&&!editor.rotating&&!editor.adjustingArea;renderSelectionFrame(rt,shape,mainScale,drawing);auto b=shape.rawBounds();float padding=snip::selectionPadding(shape,mainScale);auto resize=shape.resizeHandle(padding),rotate=shape.rotateHandle(28*mainScale,padding),top=shape.toWorld({(b.l+b.r)/2,b.t-padding});
                 rt->CreateSolidColorBrush(rgb(0xB4C4CC),&brush);if(brush){rt->DrawLine(pt(top),pt(rotate),brush,1);brush->SetColor(rgb(ACCENT));rt->FillEllipse(D2D1::Ellipse(pt(resize),3.5f*mainScale,3.5f*mainScale),brush);rt->DrawEllipse(D2D1::Ellipse(pt(rotate),4*mainScale,4*mainScale),brush,1.5f);release(brush);}}
-        }else{fill(rt,{0,0,sw,sh},0,.42f);fill(rt,{sw/2-280,70,sw/2+280,160},0x20262E,.98f);text(rt,editor.recording?L"框选录制区域":L"拖动鼠标，截取一块屏幕",{sw/2-255,84,sw/2+255,125},25,0xFFFFFF,true);text(rt,L"按 Esc 取消 · 支持跨屏截图",{sw/2-255,127,sw/2+255,158},16,0xBDD4D8);}
-        if(editor.selected&&editor.toolbarVisible&&!editor.toolbar.empty()){auto b=editor.toolbarBounds;ID2D1SolidColorBrush* bar=nullptr;rt->CreateSolidColorBrush(rgb(0x20262E),&bar);if(bar){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(float(b.left),float(b.top),float(b.right),float(b.bottom)),10*mainScale,10*mainScale),bar);if(!editor.recording){bar->SetColor(rgb(0x46515E));for(int index:{4,6,8,12}){RECT r;GetWindowRect(editor.toolbar[index],&r);int x=r.right-editor.desktop.left+int(6*mainScale);rt->DrawLine({float(x),float(b.top)+12*mainScale},{float(x),float(b.bottom)-12*mainScale},bar,1);}}release(bar);}}
+        }else{fill(rt,{0,0,sw,sh},0,.42f);fill(rt,{sw/2-280,70,sw/2+280,160},0x20262E,.98f);const wchar_t* title=editor.mode==CaptureMode::Record?L"框选录制区域":editor.mode==CaptureMode::Scroll?L"框选长截图区域":L"拖动鼠标，截取一块屏幕";text(rt,title,{sw/2-255,84,sw/2+255,125},25,0xFFFFFF,true);text(rt,L"按 Esc 取消 · 支持跨屏截图",{sw/2-255,127,sw/2+255,158},16,0xBDD4D8);}
+        if(editor.selected&&editor.toolbarVisible&&!editor.toolbar.empty()){auto b=editor.toolbarBounds;ID2D1SolidColorBrush* bar=nullptr;rt->CreateSolidColorBrush(rgb(0x20262E),&bar);if(bar){rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(float(b.left),float(b.top),float(b.right),float(b.bottom)),10*mainScale,10*mainScale),bar);if(editor.mode==CaptureMode::Screenshot){bar->SetColor(rgb(0x46515E));for(int index:{4,6,8,13}){RECT r;GetWindowRect(editor.toolbar[index],&r);int x=r.right-editor.desktop.left+int(6*mainScale);rt->DrawLine({float(x),float(b.top)+12*mainScale},{float(x),float(b.bottom)-12*mainScale},bar,1);}}release(bar);}}
         if(FAILED(rt->EndDraw())){release(editor.background);release(editor.rt);}
     }EndPaint(hwnd,&paint);
 }
@@ -211,7 +219,7 @@ void editorCommand(int id){
     case Color:showPalette();return;
     case Thickness:showStroke();return;
     case Undo:editor.history(false);break;case Redo:editor.history(true);break;
-    case Copy:case Save:case Pin:case StartRecord:finishCapture(id);return;
+    case Copy:case Save:case Pin:case LongCapture:case StartRecord:finishCapture(id);return;
     case Reselect:editor.toolbarVisible=false;editor.hoverSnap=false;editor.selected=false;editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;for(HWND b:editor.toolbar)ShowWindow(b,SW_HIDE);ShowWindow(editor.hint,SW_HIDE);break;
     case Cancel:DestroyWindow(overlay);return;
     }
@@ -234,21 +242,23 @@ LRESULT CALLBACK overlayProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_SETCURSOR:if(editorCursor(hwnd))return TRUE;break;
     case WM_KEYDOWN:
         if(wp==VK_ESCAPE){editorCommand(Cancel);return 0;}
-        if(wp==VK_RETURN&&editor.selected){finishCapture(editor.recording?StartRecord:Copy);return 0;}
+        if(wp==VK_RETURN&&editor.selected){finishCapture(editor.mode==CaptureMode::Record?StartRecord:editor.mode==CaptureMode::Scroll?LongCapture:Copy);return 0;}
         if(GetKeyState(VK_CONTROL)<0){if(wp=='Z'){editor.history(GetKeyState(VK_SHIFT)<0);InvalidateRect(hwnd,nullptr,FALSE);return 0;}if(wp=='Y'){editorCommand(Redo);return 0;}if(wp=='C'&&editor.selected){finishCapture(Copy);return 0;}if(wp=='S'&&editor.selected){finishCapture(Save);return 0;}}
         if(wp==VK_DELETE&&editor.active>=0){editor.checkpoint();editor.shapes.erase(editor.shapes.begin()+editor.active);editor.active=-1;InvalidateRect(hwnd,nullptr,FALSE);return 0;}
-        if(!editor.recording){if(wp=='V')selectTool(snip::Tool::Select);if(wp=='R')selectTool(snip::Tool::Rectangle);if(wp=='A')selectTool(snip::Tool::Arrow);if(wp=='P')selectTool(snip::Tool::Pen);if(wp=='M')selectTool(snip::Tool::Mosaic);}return 0;
+        if(editor.mode==CaptureMode::Screenshot){if(wp=='V')selectTool(snip::Tool::Select);if(wp=='R')selectTool(snip::Tool::Rectangle);if(wp=='A')selectTool(snip::Tool::Arrow);if(wp=='P')selectTool(snip::Tool::Pen);if(wp=='M')selectTool(snip::Tool::Mosaic);if(wp=='L'&&editor.selected){finishCapture(LongCapture);return 0;}}return 0;
     case WM_DESTROY:overlay=nullptr;release(editor.background);release(editor.rt);editor.toolbar.clear();editor.hint=nullptr;editor.tips=nullptr;editor.tipText.clear();return 0;
     }return DefWindowProcW(hwnd,msg,wp,lp);
 }
-void beginCapture(bool recording){
-    if(overlay){SetForegroundWindow(overlay);return;}if(recording&&recorder.busy()){showMain();return;}
+void beginCapture(CaptureMode mode){
+    if(overlay){SetForegroundWindow(overlay);return;}if(mode==CaptureMode::Record&&recorder.busy()){showMain();return;}
+    if(scrollPanel)endScrollUI();
     hideTip();ShowWindow(mainWindow,SW_HIDE);Sleep(160);DwmFlush();
-    editor.screen={};release(editor.background);release(editor.rt);editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;editor.selected=false;editor.recording=recording;editor.dragging=false;editor.tool=snip::Tool::Rectangle;editor.toolbar.clear();editor.hint=nullptr;editor.adjustingArea=false;editor.toolbarVisible=false;editor.hoverSnap=false;editor.snapWindows=captureSnapWindows();
+    editor.screen={};release(editor.background);release(editor.rt);editor.shapes.clear();editor.past.clear();editor.future.clear();editor.active=-1;editor.selected=false;editor.mode=mode;editor.dragging=false;editor.tool=snip::Tool::Rectangle;editor.toolbar.clear();editor.hint=nullptr;editor.adjustingArea=false;editor.toolbarVisible=false;editor.hoverSnap=false;editor.snapWindows=captureSnapWindows();
     int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN),w=GetSystemMetrics(SM_CXVIRTUALSCREEN),h=GetSystemMetrics(SM_CYVIRTUALSCREEN);editor.desktop={x,y,x+w,y+h};editor.screen=captureDesktop(editor.desktop);
     POINT hover;GetCursorPos(&hover);editor.hoverSelection=snapAt(editor.snapWindows,hover,editor.desktop);editor.hoverSnap=true;
     if(!editor.screen.valid()){showMain();showError(mainWindow,L"无法读取屏幕。请确认桌面没有锁定。");return;}
-    overlay=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"ShuntieEditor",recording?L"瞬贴 · 框选录屏":L"瞬贴 · 截图标注",WS_POPUP|WS_CLIPCHILDREN,x,y,w,h,nullptr,nullptr,instance,nullptr);
+    const wchar_t* title=mode==CaptureMode::Record?L"瞬贴 · 框选录屏":mode==CaptureMode::Scroll?L"瞬贴 · 长截图":L"瞬贴 · 截图标注";
+    overlay=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"ShuntieEditor",title,WS_POPUP|WS_CLIPCHILDREN,x,y,w,h,nullptr,nullptr,instance,nullptr);
     if(!overlay){showMain();return;}ShowWindow(overlay,SW_SHOW);SetForegroundWindow(overlay);SetFocus(overlay);
 }
 bool sameMonitor(RECT area){POINT a{area.left,area.top},b{area.right-1,area.bottom-1};return MonitorFromPoint(a,MONITOR_DEFAULTTONULL)==MonitorFromPoint(b,MONITOR_DEFAULTTONULL);}
@@ -258,7 +268,13 @@ void finishCapture(int action){
         RECT area{LONG(editor.selection.l)+editor.desktop.left,LONG(editor.selection.t)+editor.desktop.top,LONG(editor.selection.r)+editor.desktop.left,LONG(editor.selection.b)+editor.desktop.top};
         if(!sameMonitor(area)){showError(overlay,L"录屏首版需要在单个显示器内框选；截图可以跨屏。");return;}
         int fps=gifFps;
-        DestroyWindow(overlay);ShowWindow(mainWindow,SW_HIDE);recorder.start(area,root,outputDir,fps);beginRecordingUI(area);return;
+        DestroyWindow(overlay);ShowWindow(mainWindow,SW_HIDE);recorder.start(area,root,outputDir,fps,gifQuality);beginRecordingUI(area);return;
+    }
+    if(action==LongCapture){
+        RECT area{LONG(editor.selection.l)+editor.desktop.left,LONG(editor.selection.t)+editor.desktop.top,LONG(editor.selection.r)+editor.desktop.left,LONG(editor.selection.b)+editor.desktop.top};
+        if(area.right-area.left<32||area.bottom-area.top<32){showError(overlay,L"选区过小。");return;}
+        if(!sameMonitor(area)){showError(overlay,L"录屏首版需要在单个显示器内框选；截图可以跨屏。");return;}
+        DestroyWindow(overlay);ShowWindow(mainWindow,SW_HIDE);beginScrollUI(area);return;
     }
     Image im=flatten(editor.screen,editor.selection,editor.shapes);if(!im.valid()){showError(overlay,L"截图生成失败，请重试。");return;}
     if(action==Copy){if(!copyImage(mainWindow,im)){showError(overlay,L"剪贴板暂时被其他程序占用，请再试一次。");return;}message(L"截图已复制到剪贴板。");}
@@ -286,14 +302,18 @@ bool setAutoStart(bool enabled){HKEY key=nullptr;if(RegCreateKeyExW(HKEY_CURRENT
     if(enabled){std::wstring command=L"\""+root+L"\\瞬贴.exe\" --tray";status=RegSetValueExW(key,L"Shuntie",0,REG_SZ,reinterpret_cast<const BYTE*>(command.c_str()),DWORD((command.size()+1)*sizeof(wchar_t)));}else{status=RegDeleteValueW(key,L"Shuntie");if(status==ERROR_FILE_NOT_FOUND)status=ERROR_SUCCESS;}RegCloseKey(key);return status==ERROR_SUCCESS;}
 void settingsLabels(){
     if(!settingsWindow)return;for(int i=0;i<3;++i){const wchar_t* labels[]={L"截图  ",L"贴图  ",L"录屏  "};bool available=i==0?captureHotkey:i==1?pinHotkey:recordHotkey;setLabel(GetDlgItem(settingsWindow,KeyCapture+i),(labels[i]+(waitingHotkey==i+1?L"请按新的快捷键…":keyLabel(i)+(available?L"":L"（占用）"))).c_str());}
-    setLabel(GetDlgItem(settingsWindow,FpsToggle),(L"GIF 帧率   "+std::to_wstring(gifFps)+L" 帧/秒").c_str());setLabel(GetDlgItem(settingsWindow,AutoStart),autoStartEnabled()?L"开机启动   已开启":L"开机启动   已关闭");InvalidateRect(settingsWindow,nullptr,FALSE);
+    setLabel(GetDlgItem(settingsWindow,FpsToggle),(L"GIF 帧率   "+std::to_wstring(gifFps)+L" 帧/秒").c_str());
+    const wchar_t* qLabel=gifQuality==0?L"GIF 画质   小体积 (≤800px)":gifQuality==1?L"GIF 画质   均衡 (≤1280px)":L"GIF 画质   原尺寸";
+    setLabel(GetDlgItem(settingsWindow,GifQualityToggle),qLabel);
+    setLabel(GetDlgItem(settingsWindow,ClickEffectToggle),showClickEffect?L"鼠标点击显示   已开启":L"鼠标点击显示   已关闭");
+    setLabel(GetDlgItem(settingsWindow,AutoStart),autoStartEnabled()?L"开机启动   已开启":L"开机启动   已关闭");InvalidateRect(settingsWindow,nullptr,FALSE);
 }
 LRESULT CALLBACK settingsProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     static ID2D1HwndRenderTarget* rt=nullptr;float s=mainScale;
     switch(msg){
-    case WM_CREATE:{auto add=[&](int id,const wchar_t* label,int x,int y,int w,int h){button(hwnd,id,label,int(x*s),int(y*s),int(w*s),int(h*s));};add(Back,L"关闭设置",286,18,34,34);add(Language,english?L"简体中文":L"English",200,60,120,25);add(KeyCapture,L"截图",24,92,252,40);add(KeyPin,L"贴图",24,140,252,40);add(KeyRecord,L"录屏",24,188,252,40);add(ClearCapture,L"清除截图快捷键",284,92,36,40);add(ClearPin,L"清除贴图快捷键",284,140,36,40);add(ClearRecord,L"清除录屏快捷键",284,188,36,40);add(FpsToggle,L"GIF 帧率",24,252,296,40);add(AutoStart,L"开机启动",24,300,296,40);add(Folder,L"输出目录",24,364,140,38);add(Hide,L"收起",180,364,140,38);add(Exit,L"退出软件",24,418,296,38);return 0;}
+    case WM_CREATE:{auto add=[&](int id,const wchar_t* label,int x,int y,int w,int h){button(hwnd,id,label,int(x*s),int(y*s),int(w*s),int(h*s));};add(Back,L"关闭设置",286,18,34,34);add(Language,english?L"简体中文":L"English",200,60,120,25);add(KeyCapture,L"截图",24,92,252,40);add(KeyPin,L"贴图",24,140,252,40);add(KeyRecord,L"录屏",24,188,252,40);add(ClearCapture,L"清除截图快捷键",284,92,36,40);add(ClearPin,L"清除贴图快捷键",284,140,36,40);add(ClearRecord,L"清除录屏快捷键",284,188,36,40);add(FpsToggle,L"GIF 帧率",24,248,296,38);add(GifQualityToggle,L"GIF 画质",24,294,296,38);add(ClickEffectToggle,L"鼠标点击显示",24,340,296,38);add(AutoStart,L"开机启动",24,386,296,38);add(Folder,L"输出目录",24,446,140,38);add(Hide,L"收起",180,446,140,38);add(Exit,L"退出软件",24,498,296,38);return 0;}
     case WM_DRAWITEM:drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lp));return TRUE;
-    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());EnumChildWindows(mainWindow,[](HWND control,LPARAM)->BOOL{wchar_t label[256]{};GetWindowTextW(control,label,256);setLabel(control,label);return TRUE;},0);setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearRecord){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyRecord){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==30?50:30;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
+    case WM_COMMAND:{int id=LOWORD(wp);if(id==Language){english=!english;WritePrivateProfileStringW(L"ui",L"english",english?L"1":L"0",(root+L"\\settings.ini").c_str());EnumChildWindows(mainWindow,[](HWND control,LPARAM)->BOOL{wchar_t label[256]{};GetWindowTextW(control,label,256);setLabel(control,label);return TRUE;},0);setLabel(GetDlgItem(hwnd,Language),english?L"简体中文":L"English");settingsLabels();setLabel(mainWindow,L"瞬贴 · 截图与录屏");RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;}if(id>=ClearCapture&&id<=ClearRecord){int i=id-ClearCapture;keyCodes[i]=0;keyModifiers[i]=0;waitingHotkey=0;registerKeys();settingsLabels();return 0;}if(id>=KeyCapture&&id<=KeyRecord){waitingHotkey=id-KeyCapture+1;SetFocus(hwnd);settingsLabels();return 0;}if(id==Back){DestroyWindow(hwnd);return 0;}if(id==FpsToggle){gifFps=gifFps==10?15:gifFps==15?20:gifFps==20?30:10;WritePrivateProfileStringW(L"export",L"fps",std::to_wstring(gifFps).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==GifQualityToggle){gifQuality=(gifQuality+1)%3;WritePrivateProfileStringW(L"export",L"quality",std::to_wstring(gifQuality).c_str(),(root+L"\\settings.ini").c_str());settingsLabels();return 0;}if(id==ClickEffectToggle){showClickEffect=!showClickEffect;WritePrivateProfileStringW(L"record",L"show_clicks",showClickEffect?L"1":L"0",(root+L"\\settings.ini").c_str());clickOverlay.setEnabled(showClickEffect);if(recordPanel){setLabel(GetDlgItem(recordPanel,ToggleClicks),showClickEffect?L"点击提示：显示中（点击切换）":L"点击提示：已隐藏（点击切换）");InvalidateRect(GetDlgItem(recordPanel,ToggleClicks),nullptr,FALSE);}settingsLabels();return 0;}if(id==AutoStart){if(!setAutoStart(!autoStartEnabled()))showError(hwnd,L"开机启动设置未能保存。");settingsLabels();return 0;}if(id==Hide){DestroyWindow(hwnd);ShowWindow(mainWindow,SW_HIDE);return 0;}if(id==Exit){DestroyWindow(hwnd);SendMessageW(mainWindow,WM_CLOSE,0,0);return 0;}mainCommand(id);return 0;}
     case WM_SYSKEYDOWN:case WM_KEYDOWN:
         if(waitingHotkey){if(wp==VK_ESCAPE){waitingHotkey=0;settingsLabels();return 0;}if(wp==VK_CONTROL||wp==VK_SHIFT||wp==VK_MENU||wp==VK_LWIN||wp==VK_RWIN)return 0;
         int i=waitingHotkey-1;UINT mod=(GetKeyState(VK_CONTROL)<0?MOD_CONTROL:0)|(GetKeyState(VK_MENU)<0?MOD_ALT:0)|(GetKeyState(VK_SHIFT)<0?MOD_SHIFT:0);UINT oldKey=keyCodes[i],oldMod=keyModifiers[i];UnregisterHotKey(mainWindow,i+1);
@@ -308,7 +328,7 @@ LRESULT CALLBACK settingsProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_DESTROY:settingsWindow=nullptr;waitingHotkey=0;release(rt);ShowWindow(GetDlgItem(mainWindow,Settings),SW_SHOW);refreshStatus();RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);return 0;
     }return DefWindowProcW(hwnd,msg,wp,lp);
 }
-void showSettings(){if(settingsWindow){SetFocus(settingsWindow);return;}SendMessageW(mainWindow,WM_SETREDRAW,FALSE,0);ShowWindow(GetDlgItem(mainWindow,Settings),SW_HIDE);ShowWindow(GetDlgItem(mainWindow,CopyGif),SW_HIDE);SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(480*mainScale),SWP_NOMOVE|SWP_NOZORDER);settingsWindow=CreateWindowExW(0,L"ShuntieSettings",L"瞬贴 · 设置",WS_CHILD|WS_CLIPCHILDREN,0,0,int(344*mainScale),int(480*mainScale),mainWindow,nullptr,instance,nullptr);settingsLabels();ShowWindow(settingsWindow,SW_SHOW);SendMessageW(mainWindow,WM_SETREDRAW,TRUE,0);RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);SetFocus(settingsWindow);}
+void showSettings(){if(settingsWindow){SetFocus(settingsWindow);return;}SendMessageW(mainWindow,WM_SETREDRAW,FALSE,0);ShowWindow(GetDlgItem(mainWindow,Settings),SW_HIDE);ShowWindow(GetDlgItem(mainWindow,CopyGif),SW_HIDE);SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(568*mainScale),SWP_NOMOVE|SWP_NOZORDER);settingsWindow=CreateWindowExW(0,L"ShuntieSettings",L"瞬贴 · 设置",WS_CHILD|WS_CLIPCHILDREN,0,0,int(344*mainScale),int(568*mainScale),mainWindow,nullptr,instance,nullptr);settingsLabels();ShowWindow(settingsWindow,SW_SHOW);SendMessageW(mainWindow,WM_SETREDRAW,TRUE,0);RedrawWindow(mainWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);SetFocus(settingsWindow);}
 void layoutMain(HWND hwnd){
     float s=mainScale;MoveWindow(GetDlgItem(hwnd,Settings),int(286*s),int(20*s),int(34*s),int(34*s),TRUE);
     MoveWindow(GetDlgItem(hwnd,CopyGif),int(24*s),int(214*s),int(296*s),int(42*s),TRUE);
@@ -318,14 +338,15 @@ void refreshStatus(){
     auto s=recorder.status();bool completed=!s.gif.empty()&&s.phase==RecordingStatus::Complete;
     if(!settingsWindow)ShowWindow(GetDlgItem(mainWindow,CopyGif),completed?SW_SHOW:SW_HIDE);
     int height=completed?280:(s.phase==RecordingStatus::Failed?250:180);RECT current;GetWindowRect(mainWindow,&current);if(!settingsWindow&&current.bottom-current.top!=int(height*mainScale))SetWindowPos(mainWindow,nullptr,0,0,int(344*mainScale),int(height*mainScale),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    clickOverlay.setRecordingActive(s.phase==RecordingStatus::Recording);
     if(recordPanel){InvalidateRect(recordPanel,nullptr,FALSE);if(recordFrame)InvalidateRect(recordFrame,nullptr,FALSE);if(s.phase==RecordingStatus::Complete||s.phase==RecordingStatus::Failed||s.phase==RecordingStatus::Idle){DestroyWindow(recordPanel);recordPanel=nullptr;if(recordFrame){DestroyWindow(recordFrame);recordFrame=nullptr;}if(s.phase!=RecordingStatus::Idle)showMain();}}
     InvalidateRect(mainWindow,nullptr,FALSE);
 }
 void mainCommand(int id){
     switch(id){
     case Settings:showSettings();break;
-    case Capture:beginCapture(false);break;case PinClipboard:pinImage(clipboardImage(mainWindow));break;
-    case Record:if(recorder.busy())recorder.stop();else beginCapture(true);break;
+    case Capture:beginCapture(CaptureMode::Screenshot);break;case LongCapture:beginCapture(CaptureMode::Scroll);break;case PinClipboard:pinImage(clipboardImage(mainWindow));break;
+    case Record:if(recorder.busy())recorder.stop();else beginCapture(CaptureMode::Record);break;
     case CopyGif:{auto s=recorder.status();if(copyFileToClipboard(mainWindow,s.gif))message(L"GIF 动图文件已复制，可粘贴到支持文件的聊天或编辑软件。");else showError(mainWindow,L"复制失败，请稍后重试。");break;}
     case OpenVideo:{auto s=recorder.status();if(!s.video.empty())ShellExecuteW(mainWindow,L"open",s.video.c_str(),nullptr,nullptr,SW_SHOWNORMAL);break;}
     case Folder:ShellExecuteW(mainWindow,L"open",outputDir.c_str(),nullptr,nullptr,SW_SHOWNORMAL);break;
@@ -343,7 +364,7 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PAINT:{PAINTSTRUCT paint;BeginPaint(hwnd,&paint);if(!rt)rt=createTarget(hwnd);if(rt){rt->BeginDraw();rt->SetTransform(D2D1::Matrix3x2F::Scale(mainScale,mainScale));rt->Clear(rgb(BG));
         // 统一使用嵌入的高清 Logo，图标资源包含 16 到 256 像素尺寸。
         if(!logo)logo=bitmapFor(rt,brandImage,true);if(logo)rt->DrawBitmap(logo,D2D1::RectF(20,17,70,67),1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.5",{83,50,240,69},10,MUTED);
+        text(rt,L"瞬贴",{82,18,240,50},22,INK,true);text(rt,L"版本 0.1.6",{83,50,240,69},10,MUTED);
         text(rt,L"截图、标注、贴图。",{24,87,320,116},19,INK);
         text(rt,L"录下操作，一键复制 GIF。",{24,118,320,148},14,MUTED);
         auto s=recorder.status();if(s.phase==RecordingStatus::Complete){fill(rt,{24,166,320,167},0x2C333C);text(rt,notice.empty()?L"GIF 已导出":notice,{24,180,320,208},12,ACCENT);}
@@ -354,20 +375,21 @@ LRESULT CALLBACK mainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:mainCommand(LOWORD(wp));return 0;
     case WM_LBUTTONDOWN:ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;
     case WM_TIMER:refreshStatus();return 0;
-    case WM_HOTKEY:if(wp==1)beginCapture(false);if(wp==2)pinImage(clipboardImage(hwnd));if(wp==3){auto s=recorder.status();if(s.phase==RecordingStatus::Starting||s.phase==RecordingStatus::Recording)recorder.stop();else if(!recorder.busy())beginCapture(true);else showMain();}return 0;
-    case TRAY_MESSAGE:if(lp==WM_LBUTTONUP||lp==WM_LBUTTONDBLCLK)showMain();if(lp==WM_RBUTTONUP){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,Capture,localize(L"截图").c_str());AppendMenuW(menu,MF_STRING,Record,localize(L"录屏 / 停止").c_str());AppendMenuW(menu,MF_STRING,Hide,localize(L"显示主窗口").c_str());AppendMenuW(menu,MF_STRING,Exit,localize(L"退出").c_str());POINT p;GetCursorPos(&p);SetForegroundWindow(hwnd);int cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,hwnd,nullptr);DestroyMenu(menu);if(cmd==Hide)showMain();else if(cmd)mainCommand(cmd);}return 0;
-    case WM_CLOSE:if(recorder.busy()){recorder.stop();showMain();message(L"正在完成当前录屏，导出后即可退出。");return 0;}if(settingsWindow)DestroyWindow(settingsWindow);DestroyWindow(hwnd);return 0;
-    case WM_DESTROY:KillTimer(hwnd,1);Shell_NotifyIconW(NIM_DELETE,&tray);UnregisterHotKey(hwnd,1);UnregisterHotKey(hwnd,2);UnregisterHotKey(hwnd,3);release(logo);release(rt);PostQuitMessage(0);return 0;
+    case WM_HOTKEY:if(wp==1)beginCapture(CaptureMode::Screenshot);if(wp==2)pinImage(clipboardImage(hwnd));if(wp==3){auto s=recorder.status();if(s.phase==RecordingStatus::Starting||s.phase==RecordingStatus::Recording)recorder.stop();else if(!recorder.busy())beginCapture(CaptureMode::Record);else showMain();}return 0;
+    case TRAY_MESSAGE:if(lp==WM_LBUTTONUP||lp==WM_LBUTTONDBLCLK)showMain();if(lp==WM_RBUTTONUP){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,Capture,localize(L"截图").c_str());AppendMenuW(menu,MF_STRING,LongCapture,localize(L"长截图").c_str());AppendMenuW(menu,MF_STRING,Record,localize(L"录屏 / 停止").c_str());AppendMenuW(menu,MF_STRING,Hide,localize(L"显示主窗口").c_str());AppendMenuW(menu,MF_STRING,Exit,localize(L"退出").c_str());POINT p;GetCursorPos(&p);SetForegroundWindow(hwnd);int cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,p.x,p.y,0,hwnd,nullptr);DestroyMenu(menu);if(cmd==Hide)showMain();else if(cmd)mainCommand(cmd);}return 0;
+    case WM_CLOSE:if(recorder.busy()){recorder.stop();showMain();message(L"正在完成当前录屏，导出后即可退出。");return 0;}if(scrollPanel)endScrollUI();if(settingsWindow)DestroyWindow(settingsWindow);DestroyWindow(hwnd);return 0;
+    case WM_DESTROY:endScrollUI();clickOverlay.stop();KillTimer(hwnd,1);Shell_NotifyIconW(NIM_DELETE,&tray);UnregisterHotKey(hwnd,1);UnregisterHotKey(hwnd,2);UnregisterHotKey(hwnd,3);release(logo);release(rt);PostQuitMessage(0);return 0;
     }return DefWindowProcW(hwnd,msg,wp,lp);
 }
 #include "record_ui.inl"
+#include "scroll_ui.inl"
 
 // 集成冒烟测试：真实桌面、Direct2D 导出、录屏、GIF 文件剪贴板。
 int smokeTest(){
     RECT area{160,160,800,640};auto screen=captureDesktop(area);std::vector<snip::Shape> shapes;
     snip::Shape box;box.a={20,20};box.b={260,160};shapes.push_back(box);snip::Shape arrow;arrow.tool=snip::Tool::Arrow;arrow.a={40,200};arrow.b={420,280};shapes.push_back(arrow);
     auto image=flatten(screen,{0,0,float(screen.width),float(screen.height)},shapes);bool png=image.valid()&&savePng(image,outputDir+L"\\smoke-annotated.png");
-    recorder.start(area,root,outputDir,60);ULONGLONG deadline=GetTickCount64()+20000;while(GetTickCount64()<deadline){auto phase=recorder.status().phase;if(phase==RecordingStatus::Recording||phase==RecordingStatus::Failed)break;Sleep(100);}
+    recorder.start(area,root,outputDir,15,1);ULONGLONG deadline=GetTickCount64()+20000;while(GetTickCount64()<deadline){auto phase=recorder.status().phase;if(phase==RecordingStatus::Recording||phase==RecordingStatus::Failed)break;Sleep(100);}
     bool paused=false,resumed=false,snapshot=false,timerPaused=false;
     if(recorder.status().phase==RecordingStatus::Recording){Sleep(700);recorder.pause();deadline=GetTickCount64()+10000;while(GetTickCount64()<deadline&&recorder.status().phase!=RecordingStatus::Paused)Sleep(50);paused=recorder.status().phase==RecordingStatus::Paused;
         if(paused){auto before=recorder.status().elapsedMs;Sleep(1000);timerPaused=recorder.status().elapsedMs==before;recorder.copySnapshot();deadline=GetTickCount64()+30000;while(GetTickCount64()<deadline&&!(recorder.status().phase==RecordingStatus::Paused&&recorder.status().copyVersion>0))Sleep(100);snapshot=recorder.status().copyVersion>0;recorder.resume();deadline=GetTickCount64()+10000;while(GetTickCount64()<deadline&&recorder.status().phase!=RecordingStatus::Recording)Sleep(50);resumed=recorder.status().phase==RecordingStatus::Recording;if(resumed)Sleep(700);}}
@@ -386,26 +408,32 @@ int WINAPI wWinMain(HINSTANCE h,HINSTANCE,LPWSTR args,int){
     if(wcsstr(args,L"--smoke-test")){int result=smokeTest();release(wic);release(writeFactory);release(d2d);CoUninitialize();return result;}
     HANDLE singleton=CreateMutexW(nullptr,FALSE,L"Local\\ShuntieStudio-FirstRelease");if(GetLastError()==ERROR_ALREADY_EXISTS){HWND other=FindWindowW(L"ShuntieMain",nullptr);if(other){ShowWindow(other,SW_SHOW);SetForegroundWindow(other);}CloseHandle(singleton);return 0;}
     mainScale=float(GetDpiForSystem())/96;uiFont=CreateFontW(-int(15*mainScale),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");appIcon=makeIcon();
-    struct Class{const wchar_t* name;WNDPROC proc;};Class classes[]={{L"ShuntieMain",mainProc},{L"ShuntieEditor",overlayProc},{L"ShuntiePin",pinProc},{L"ShuntieRecord",recordProc},{L"ShuntieFrame",frameProc},{L"ShuntieSettings",settingsProc},{L"ShuntieTip",tipProc},{L"ShuntieStroke",strokeProc}};
+    struct Class{const wchar_t* name;WNDPROC proc;};Class classes[]={{L"ShuntieMain",mainProc},{L"ShuntieEditor",overlayProc},{L"ShuntiePin",pinProc},{L"ShuntieRecord",recordProc},{L"ShuntieFrame",frameProc},{L"ShuntieScrollFrame",scrollFrameProc},{L"ShuntieScrollPanel",scrollPanelProc},{L"ShuntieSettings",settingsProc},{L"ShuntieTip",tipProc},{L"ShuntieStroke",strokeProc}};
     smallIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(1),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),0));
     WNDCLASSEXW paletteClass{};paletteClass.cbSize=sizeof(paletteClass);paletteClass.lpfnWndProc=paletteProc;paletteClass.hInstance=h;paletteClass.hCursor=LoadCursorW(nullptr,IDC_ARROW);paletteClass.lpszClassName=L"ShuntiePalette";RegisterClassExW(&paletteClass);
     for(auto c:classes){WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.lpfnWndProc=c.proc;wc.hInstance=h;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=appIcon;wc.hIconSm=smallIcon;wc.lpszClassName=c.name;if(!RegisterClassExW(&wc))return 1;}
     DWORD style=WS_POPUP|WS_CLIPCHILDREN;
     RECT work;SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);int w=int(344*mainScale),he=int(180*mainScale);
     mainWindow=CreateWindowExW(0,L"ShuntieMain",L"瞬贴 · 截图与录屏",style,(work.right-w)/2,(work.bottom-he)/2,w,he,nullptr,nullptr,h,nullptr);if(!mainWindow)return 1;setLabel(mainWindow,L"瞬贴 · 截图与录屏");
-    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<3;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}gifFps=GetPrivateProfileIntW(L"export",L"fps",30,ini.c_str())>30?50:30;registerKeys();roundWindow(mainWindow);
+    std::wstring ini=root+L"\\settings.ini";for(int i=0;i<3;++i){keyCodes[i]=GetPrivateProfileIntW(L"shortcuts",(L"key"+std::to_wstring(i)).c_str(),keyCodes[i],ini.c_str());keyModifiers[i]=GetPrivateProfileIntW(L"shortcuts",(L"mod"+std::to_wstring(i)).c_str(),keyModifiers[i],ini.c_str());}
+    int rawFps=GetPrivateProfileIntW(L"export",L"fps",15,ini.c_str());gifFps=(rawFps==10||rawFps==15||rawFps==20||rawFps==30)?rawFps:(rawFps<=12?10:rawFps<=17?15:rawFps<=25?20:30);
+    gifQuality=std::clamp<int>(GetPrivateProfileIntW(L"export",L"quality",1,ini.c_str()),0,2);
+    showClickEffect=GetPrivateProfileIntW(L"record",L"show_clicks",1,ini.c_str())!=0;
+    registerKeys();roundWindow(mainWindow);
     tray.cbSize=sizeof(tray);tray.hWnd=mainWindow;tray.uID=1;tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;tray.uCallbackMessage=TRAY_MESSAGE;tray.hIcon=smallIcon?smallIcon:appIcon;wcscpy(tray.szTip,L"瞬贴 · 截图 / 贴图 / 录屏");Shell_NotifyIconW(NIM_ADD,&tray);
     refreshStatus();if(!wcsstr(args,L"--tray"))ShowWindow(mainWindow,SW_SHOW);UpdateWindow(mainWindow);MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)>0){
         // 工具按钮获得焦点后仍由编辑器处理 Enter、Esc 和撤销快捷键。
         if(strokeWindow&&msg.message==WM_KEYDOWN){SendMessageW(strokeWindow,msg.message,msg.wParam,msg.lParam);continue;}
         if(paletteWindow&&msg.message==WM_KEYDOWN){SendMessageW(paletteWindow,msg.message,msg.wParam,msg.lParam);continue;}
+        if(scrollPanel&&msg.message==WM_KEYDOWN){SendMessageW(scrollPanel,msg.message,msg.wParam,msg.lParam);continue;}
 
         if(overlay&&msg.message==WM_KEYDOWN){SendMessageW(overlay,msg.message,msg.wParam,msg.lParam);continue;}
         if(settingsWindow&&(msg.message==WM_KEYDOWN||msg.message==WM_SYSKEYDOWN)&&waitingHotkey){SendMessageW(settingsWindow,msg.message,msg.wParam,msg.lParam);continue;}
         if(!overlay&&(msg.hwnd==mainWindow||IsChild(mainWindow,msg.hwnd))&&IsDialogMessageW(mainWindow,&msg))continue;TranslateMessage(&msg);DispatchMessageW(&msg);
     }
-    // 退出时先销毁仍打开的贴图，释放其渲染资源。
+    // 退出时先销毁仍打开的贴图、长截图和点击指示资源。
+    endScrollUI();clickOverlay.stop();
     HWND pin;while((pin=FindWindowW(L"ShuntiePin",nullptr)))DestroyWindow(pin);
     DeleteObject(uiFont);DestroyIcon(appIcon);if(smallIcon)DestroyIcon(smallIcon);CloseHandle(singleton);release(wic);release(writeFactory);release(d2d);CoUninitialize();return 0;
 }

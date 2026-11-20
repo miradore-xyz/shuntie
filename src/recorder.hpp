@@ -22,13 +22,13 @@ class Recorder {
     HANDLE pauseEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     HANDLE resumeEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     HANDLE copyEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
-    void run(RECT area, std::wstring root, std::wstring output, int fps);
+    void run(RECT area, std::wstring root, std::wstring output, int fps, int gifQuality);
     void update(RecordingStatus::Phase phase, const std::wstring& message);
 public:
     ~Recorder();
     RecordingStatus status();
     bool busy();
-    bool start(RECT area,const std::wstring& root,const std::wstring& output,int gifFps);
+    bool start(RECT area,const std::wstring& root,const std::wstring& output,int gifFps,int gifQuality=1);
     void stop();
     void pause();
     void resume();

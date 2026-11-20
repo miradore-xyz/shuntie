@@ -6,7 +6,7 @@ void editorMouseDown(HWND hwnd,snip::Point p){
     else if(rotate){editor.checkpoint();editor.rotating=true;auto& shape=editor.shapes[editor.active];auto c=shape.center();editor.initialRotation=shape.rotation;editor.initialPolar=std::atan2(p.y-c.y,p.x-c.x);}
     else if(resize){editor.checkpoint();editor.resizing=true;}
     else if((editor.areaEdge=snip::areaHandle(editor.selection,p,7*mainScale))>=0){editor.adjustingArea=true;editor.areaBefore=editor.selection;editor.toolbarVisible=false;HDWP positions=BeginDeferWindowPos(int(editor.toolbar.size()));for(HWND b:editor.toolbar)positions=DeferWindowPos(positions,b,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_HIDEWINDOW);if(positions)EndDeferWindowPos(positions);}
-    else if(editor.selection.contains(p)&&!editor.recording){
+    else if(editor.selection.contains(p)&&editor.mode==CaptureMode::Screenshot){
         if(editor.tool==snip::Tool::Select){editor.active=-1;for(int i=int(editor.shapes.size())-1;i>=0;--i)if(snip::hit(editor.shapes[i],p)){editor.active=i;break;}if(editor.active>=0){editor.checkpoint();editor.moving=true;}}
         else{editor.checkpoint();snip::Shape shape;shape.tool=editor.tool;shape.a=p;shape.b=p;shape.color=colors[editor.colorIndex];shape.stroke=editor.stroke;if(shape.tool==snip::Tool::Pen)shape.points.push_back(p);editor.shapes.push_back(shape);editor.active=int(editor.shapes.size())-1;}
     }else editor.dragging=false;

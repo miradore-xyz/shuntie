@@ -1,4 +1,4 @@
-param([switch]$Test)
+﻿param([switch]$Test)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
@@ -25,6 +25,10 @@ if ($Test) {
     if ($LASTEXITCODE -ne 0) { throw '选中框渲染检查编译失败' }
     & .\tools\selection-render-test.exe
     if ($LASTEXITCODE -ne 0) { throw '选中框渲染检查失败' }
+    & zig c++ -std=c++17 -O2 -UNDEBUG -municode tests/scroll_stitch_test.cpp -o tools/scroll-stitch-test.exe -luser32 -lgdi32 -lole32 -luuid -ld2d1 -ldwrite -lwindowscodecs
+    if ($LASTEXITCODE -ne 0) { throw '长截图拼接测试编译失败' }
+    & .\tools\scroll-stitch-test.exe
+    if ($LASTEXITCODE -ne 0) { throw '长截图拼接测试失败' }
     & zig c++ -std=c++17 -O2 -municode tests/gif_export_test.cpp -o tools/gif-export-test.exe -luser32 -lshell32 -lole32 -ldxgi -luuid
     if ($LASTEXITCODE -ne 0) { throw 'GIF 导出回归入口编译失败' }
 }

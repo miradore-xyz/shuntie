@@ -1,7 +1,7 @@
 // 由 tools/generate_assets.py 根据 Lucide SVG 自动生成，许可见 assets/lucide/LICENSE。
 #pragma once
 #include "graphics.hpp"
-enum class Icon {scan_line,clipboard_paste,video,copy,folder_open,minus,x,mouse_pointer_2,square,move_up_right,pencil,grid_2x2,palette,undo_2,redo_2,save,pin,refresh_cw,circle_stop,sliders_horizontal,play,pause};
+enum class Icon {scan_line,clipboard_paste,video,copy,folder_open,minus,x,mouse_pointer_2,square,move_up_right,pencil,grid_2x2,palette,undo_2,redo_2,save,pin,refresh_cw,circle_stop,sliders_horizontal,play,pause,chevrons_down,mouse_pointer_click};
 inline void drawIcon(ID2D1RenderTarget* rt,Icon icon,float x,float y,float size,unsigned color){
 ID2D1SolidColorBrush* brush=nullptr; ID2D1StrokeStyle* strokeStyle=nullptr; rt->CreateSolidColorBrush(rgb(color),&brush); if(!brush)return;
 auto props=D2D1::StrokeStyleProperties();props.startCap=props.endCap=props.dashCap=D2D1_CAP_STYLE_ROUND;props.lineJoin=D2D1_LINE_JOIN_ROUND;d2d->CreateStrokeStyle(props,nullptr,0,&strokeStyle);
@@ -446,5 +446,59 @@ break;
 case Icon::pause:
 rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(14.0f,3.0f,19.0f,21.0f),1.0f,1.0f),brush,1.7f,strokeStyle);
 rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(5.0f,3.0f,10.0f,21.0f),1.0f,1.0f),brush,1.7f,strokeStyle);
+break;
+case Icon::chevrons_down:
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({7.0f,6.0f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({12.0f,11.0f});
+sink->AddLine({17.0f,6.0f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({7.0f,13.0f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({12.0f,18.0f});
+sink->AddLine({17.0f,13.0f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+break;
+case Icon::mouse_pointer_click:
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({14.0f,4.1f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({12.0f,6.0f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({5.1f,8.0f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({2.2f,7.2f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({6.0f,12.0f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({4.1f,14.0f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({7.2f,2.2f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddLine({8.0f,5.1f});
+sink->EndFigure(D2D1_FIGURE_END_OPEN);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
+{ ID2D1PathGeometry* geometry=nullptr; ID2D1GeometrySink* sink=nullptr;
+if(SUCCEEDED(d2d->CreatePathGeometry(&geometry)) && SUCCEEDED(geometry->Open(&sink))){
+sink->BeginFigure({9.037f,9.69f},D2D1_FIGURE_BEGIN_HOLLOW);
+sink->AddArc({{9.69f,9.037f},{0.498f,0.498f},0.0f,D2D1_SWEEP_DIRECTION_CLOCKWISE,D2D1_ARC_SIZE_SMALL});
+sink->AddLine({20.69f,13.537f});
+sink->AddArc({{20.616f,14.486f},{0.5f,0.5f},0.0f,D2D1_SWEEP_DIRECTION_CLOCKWISE,D2D1_ARC_SIZE_SMALL});
+sink->AddLine({16.267f,15.527f});
+sink->AddArc({{15.527f,16.266f},{1.0f,1.0f},0.0f,D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,D2D1_ARC_SIZE_SMALL});
+sink->AddLine({14.487f,20.616f});
+sink->AddArc({{13.537f,20.69f},{0.5f,0.5f},0.0f,D2D1_SWEEP_DIRECTION_CLOCKWISE,D2D1_ARC_SIZE_SMALL});
+sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+sink->Close(); rt->DrawGeometry(geometry,brush,1.7f,strokeStyle); } release(sink); release(geometry); }
 break;
 }rt->SetTransform(old);release(strokeStyle);release(brush);}
